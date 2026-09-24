@@ -4,7 +4,7 @@
 
 | 资产 | 位置 | 用途 |
 | --- | --- | --- |
-| 跨平台配置包 | `docs/expert-team/` | 20 张岗位卡系统提示词、主文档、RACI 矩阵 CSV、门禁与落地清单。可直接导入 **Dify / Coze / LangGraph / AutoGen / GitLab Duo / 内部自研 Agent 平台** |
+| 跨平台配置包 | `docs/expert-team/` | 21 张卡片系统提示词（00-路由Agent + 20 张岗位卡）、主文档、RACI 矩阵 CSV、门禁与落地清单。可直接导入 **Dify / Coze / LangGraph / AutoGen / GitLab Duo / 内部自研 Agent 平台** |
 | OpenCode Agent 版 | `.opencode/agents/` | 本环境可直接调用的 **1 个路由 Agent + 20 个专家子 Agent**，默认只读、按岗位最小权限 |
 
 ## 目录结构
@@ -19,10 +19,12 @@
 │   ├── 03-跨域RACI.md                         # RACI 规则与 A/R/C/I 分配
 │   ├── 04-编排与门禁.md                       # 路由Agent/7道门禁/技术治理委员会
 │   ├── 05-落地清单与度量.md                   # 落地步骤与月度度量指标
-│   ├── agent-cards/                           # 20 张岗位卡（可直接作系统提示词）
-│   │   ├── 01-产品专家.md ... 20-技术文档知识治理.md
+│   ├── agent-cards/                           # 21 张卡：00-路由Agent + 20 张岗位卡
+│   │   ├── 00-路由Agent.md ... 20-技术文档知识治理.md
 │   └── raci/
 │       └── RACI矩阵.csv                       # 机器可读 RACI
+├── scripts/
+│   └── validate-expert-team.mjs               # 一致性校验：结构/编号/引用/RACI双写
 └── .opencode/agents/                          # ── OpenCode Agent 版 ──
     ├── router.md                              # 路由Agent：只分诊、不持A，按RACI派单
     └── expert/                                # 20 个专家子Agent（只读）
@@ -47,11 +49,18 @@
 
 ### B. OpenCode
 
-- 主会话内直接说：`把当前改动交给 expert/18-security 评审`、`让路由Agent按RACI派单评审这次需求`。
+- 主会话内直接说：`把当前改动交给 expert/18-security 评审`、`让路由Agent按RACI派单评审这次需求`、`让 expert/14-qa-governance 检查合规测试用例（同意/注销/导出/保留）缺口`。
 - 也可把会话主 Agent 切到 `router`（路由），按 RACI 自动派单给 20 个专家子 Agent。
-- 所有专家 Agent 均默认**只读**（read/glob/grep），个别岗位额外开放 web 检索；不做任何写操作。系统提示词具备「不编造、无工具数据不输出指标、高风险只出建议并升级」等约束。
+- 所有专家 Agent 均默认**只读**（read/glob/grep），安全/合规/架构/iOS/Android/前端性能安全 6 岗额外开放 web 检索（只读）；不做任何写操作。系统提示词具备「不编造、无工具数据不输出指标、高风险只出建议并升级」等约束。
+- 提示词中「公司」为通用占位，无需替换；跨平台岗位卡中才是 `{公司}` 模板变量。
 
-> 路由 Agent 与专家 Agent 的详细说明见 `.opencode/agents/` 下各文件头注释。
+### C. 日常维护
+
+- 改动任何岗位定义（岗位卡/OpenCode Agent/RACI）后，运行一致性校验：
+  `node scripts/validate-expert-team.mjs`（校验编号、frontmatter、路由引用、命名对应、RACI 双写一致）。
+- 生产/个保/等保/安全放行均走人工签批，Agent 只出建议；跨域争议交技术治理委员会。
+
+> 路由 Agent 与专家 Agent 的详细说明见 `.opencode/agents/` 下各文件头注释与正文「权威口径」段。
 
 ## 20 岗速览
 
