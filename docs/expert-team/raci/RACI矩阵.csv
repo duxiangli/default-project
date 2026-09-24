@@ -1,0 +1,16 @@
+事项,A,R,C,I
+需求范围,产品,产品Agent/产品,架构/各域/UI/QA/安全/合规,全员
+排期与里程碑,PMO,PMO,产品/各首席,治理委
+总体架构/ADR/选型,架构,各首席,产品/安全/DBA/DevOps/合规,PMO/QA
+Web前端,前端Web,前端Web Agent/人,UI/BFF/性能前端/DevOps,QA
+组件/跨端,组件首席,组件Agent,UI/Web/业务前端,QA/DevOps
+前端性能安全,性能安全首席,Agent,Web/组件/UI/安全/DevOps,QA
+iOS/Android,对应移动首席,移动Agent,UI/后端/DevOps/安全,QA
+后端身份/事务/读扩/集成,对应域首席,域Agent,架构/DBA/安全/QA,PMO
+测试功能放行,QA治理,QA/开发,架构/产品/安全/合规/DevOps,PMO
+性能容量放行,QA性能,QA/开发,架构/DevOps/DBA,产品/PMO
+发布与生产稳定,DevOps,DevOps Agent,架构/各开发/DBA/安全/QA,产品/PMO
+数据库/数据管道,DBA,DBA Agent,后端/架构/安全/合规,QA/PMO
+安全漏洞/SDL,安全,安全Agent,架构/DevOps/各开发/DBA/合规,QA/PMO
+个保/PIA/等保/密评/审计,合规,合规Agent,安全/DBA/架构/产品/QA,全员
+文档/知识资产,文档,文档Agent,架构/各开发/安全/合规/DevOps,全员
