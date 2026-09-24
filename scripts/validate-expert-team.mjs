@@ -119,5 +119,40 @@ for (const f of [...routerText && [], ...expertFiles.map((f) => `expert/${f}`)])
 }
 if (!stray) ok('OpenCode Agent 无 {公司} 字面量');
 
+// ── 8. 首席名册一致性（单一事实源） ──
+const rosterCsv = await readFile('docs/expert-team/roster/首席名册.csv', 'utf8');
+const rosterRows = rosterCsv
+  .replace(/^\uFEFF/, '')
+  .trim()
+  .split(/\r?\n/)
+  .slice(1)
+  .map((l) => l.split(','));
+if (rosterRows.length === 20) ok('名册 CSV 共 20 人');
+else bad(`名册 CSV 应为 20 人，实际 ${rosterRows.length}`);
+const emptyFields = rosterRows.filter((r) => r.some((f) => !f.trim()));
+if (emptyFields.length === 0) ok('名册字段（职位/姓名/工号/日期/签发人）无空值');
+else bad(`名册存在空字段: ${emptyFields.map((r) => r[0]).join(',')}`);
+const rosterMap = new Map(rosterRows.map((r) => [Number(r[0]), { role: r[2], name: r[3] }]));
+
+const overviewText = await readFile('docs/expert-team/00-体系总览.md', 'utf8');
+const rosterMiss = [];
+for (let i = 1; i <= 20; i++) {
+  const r = rosterMap.get(i);
+  if (!r) { rosterMiss.push(`缺${i}`); continue; }
+  const cardFile = (await readdir(cardsDir)).find((f) => f.startsWith(String(i).padStart(2, '0') + '-'));
+  const card = await readFile(path.join(cardsDir, cardFile), 'utf8');
+  const agent = await readFile(path.join(expertDir, expertFiles.find((f) => f.startsWith(String(i).padStart(2, '0') + '-'))), 'utf8');
+  if (!card.includes(`${r.role} · ${r.name}`)) rosterMiss.push(`卡${i}缺姓名`);
+  if (!agent.includes(`人类首席（${r.role} · ${r.name}）`)) rosterMiss.push(`Agent${i}缺姓名`);
+  if (!routerText.includes(`${r.role} · ${r.name}`)) rosterMiss.push(`router缺${r.name}`);
+  if (!overviewText.includes(`${r.role} · ${r.name}`)) rosterMiss.push(`00总览缺${r.name}`);
+}
+const readme = await readFile('README.md', 'utf8');
+for (const r of rosterRows) {
+  if (!readme.includes(`${r[2]} · ${r[3]}`)) rosterMiss.push(`README缺${r[3]}`);
+}
+if (rosterMiss.length === 0) ok('名册 ↔ 岗位卡 ↔ 专家Agent ↔ router ↔ 00总览/README 姓名一致（20/20）');
+else bad(`名册传播不完整: ${rosterMiss.join('; ')}`);
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

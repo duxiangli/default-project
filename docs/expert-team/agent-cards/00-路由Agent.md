@@ -26,26 +26,26 @@
 # 分诊路由表（事项 → 主派R → 咨询C → 人类A）
 | 事项 | R | C | A(人类) |
 |---|---|---|---|
-| 新需求/需求变更/优先级 | 产品Agent | 架构/UI/QA/安全/合规 | 首席产品 |
-| 排期冲突/里程碑/依赖 | PMO Agent | 各域首席 | 首席PMO |
-| 设计稿/体验/无障碍/同意旅程 | UIUX Agent | 合规 | 首席UIUX |
-| Web前端diff/SSR/BFF/首屏 | 前端Web Agent | 组件/前端性能/DevOps | 前端Web首席 |
-| 组件库/跨端/小程序/Monorepo | 组件Agent | UI/Web | 组件首席 |
-| 前端性能/XSS/CSP/第三方SDK | 前端性能安全Agent | Web/安全 | 前端性能安全首席 |
-| iOS diff/机型/商店隐私 | iOS Agent | 合规/DevOps | iOS首席 |
+| 新需求/需求变更/优先级 | 产品Agent | 架构/UI/QA/安全/合规 | 首席产品 · 陈亦凡 |
+| 排期冲突/里程碑/依赖 | PMO Agent | 各域首席 | 首席PMO · 林若曦 |
+| 设计稿/体验/无障碍/同意旅程 | UIUX Agent | 合规 | 首席UIUX · 沈清和 |
+| Web前端diff/SSR/BFF/首屏 | 前端Web Agent | 组件/前端性能/DevOps | 前端Web首席 · 周子墨 |
+| 组件库/跨端/小程序/Monorepo | 组件Agent | UI/Web | 组件首席 · 吴景行 |
+| 前端性能/XSS/CSP/第三方SDK | 前端性能安全Agent | Web/安全 | 前端性能安全首席 · 郑思远 |
+| iOS diff/机型/商店隐私 | iOS Agent | 合规/DevOps | iOS首席 · 孙嘉树 |
 | Android/Flutter/RN/商店合规 | Android Agent | 合规/DevOps | Android首席 |
-| OAuth/权限/多租户/网关 | 身份Agent | 架构/安全/DBA | 身份首席 |
-| 支付/订单/对账/资损/事务 | 事务Agent | DBA/安全/合规 | 事务域首席 |
-| 缓存/搜索/容量读扩展 | 读扩Agent | 架构/DevOps | 读扩域首席 |
-| 接口/事件/第三方/数据契约 | 集成Agent | DBA/安全/合规 | 集成首席 |
-| 架构/ADR/选型/跨域边界 | 架构Agent | 相关域首席 | 首席架构 |
-| 测试放行/逃逸/合规测试用例 | QA测试治理Agent | 架构/安全/合规 | 测试治理首席 |
-| 压测/容量/SLO/混沌 | QA性能Agent | 架构/DevOps/DBA | 性能可靠首席 |
-| 发布/回滚/K8s/可观测 | DevOps Agent | 架构/DBA/安全/QA | DevOps首席 |
-| 数据库/ETL/脱敏/备份 | DBA Agent | 集成/安全/合规 | DBA首席 |
-| 漏洞/SAST/威胁建模/等保技术 | 安全Agent | 架构/DevOps/DBA | 安全首席 |
-| PIA/个保/跨境/等保密评 | 合规Agent | 安全/DBA/架构/QA | 合规首席/个保负责人 |
-| 文档/ADR归档/Runbook/审计证据 | 文档Agent | 架构/安全/合规 | 文档首席 |
+| OAuth/权限/多租户/网关 | 身份Agent | 架构/安全/DBA | 身份首席 · 冯致远 |
+| 支付/订单/对账/资损/事务 | 事务Agent | DBA/安全/合规 | 事务域首席 · 蒋澜 |
+| 缓存/搜索/容量读扩展 | 读扩Agent | 架构/DevOps | 读扩域首席 · 韩深 |
+| 接口/事件/第三方/数据契约 | 集成Agent | DBA/安全/合规 | 集成首席 · 唐予安 |
+| 架构/ADR/选型/跨域边界 | 架构Agent | 相关域首席 | 首席架构 · 曹立言 |
+| 测试放行/逃逸/合规测试用例 | QA测试治理Agent | 架构/安全/合规 | 测试治理首席 · 许望舒 |
+| 压测/容量/SLO/混沌 | QA性能Agent | 架构/DevOps/DBA | 性能可靠首席 · 邓启明 |
+| 发布/回滚/K8s/可观测 | DevOps Agent | 架构/DBA/安全/QA | DevOps首席 · 崔明澈 |
+| 数据库/ETL/脱敏/备份 | DBA Agent | 集成/安全/合规 | DBA首席 · 苏时雨 |
+| 漏洞/SAST/威胁建模/等保技术 | 安全Agent | 架构/DevOps/DBA | 安全首席 · 罗承嗣 |
+| PIA/个保/跨境/等保密评 | 合规Agent | 安全/DBA/架构/QA | 合规首席/个保负责人 · 高叙 |
+| 文档/ADR归档/Runbook/审计证据 | 文档Agent | 架构/安全/合规 | 文档首席 · 萧云衢 |
 
 # 工作流
 1. 识别事项类型（跨域拆分子事项，各配一个A）；

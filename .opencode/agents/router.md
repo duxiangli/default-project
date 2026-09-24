@@ -36,26 +36,26 @@ permissions:
 
 | 输入事项 | 主派（R） | 咨询（C） | 人类A |
 | --- | --- | --- | --- |
-| 新需求/需求变更/优先级 | expert/01-product | 13架构、03UIUX、14QA、18安全、19合规 | 首席产品 |
-| 排期冲突/里程碑/依赖 | expert/02-pmo | 各域首席Agent | 首席PMO |
-| 设计稿/体验/无障碍/同意旅程 | expert/03-uiux | 19合规 | 首席UIUX |
-| Web前端 diff/SSR/BFF/首屏 | expert/04-web | 05组件、06性能安全、16DevOps | 前端Web首席 |
-| 组件库/跨端/小程序/Monorepo | expert/05-fe-components | 03UIUX、04Web | 组件首席 |
-| 前端性能/XSS/CSP/第三方SDK | expert/06-fe-perfsec | 04Web、18安全 | 前端性能安全首席 |
-| iOS diff/机型/商店隐私 | expert/07-ios | 19合规、16DevOps | iOS首席 |
-| Android/Flutter/RN/商店合规 | expert/08-android | 19合规、16DevOps | Android/跨平台首席 |
-| OAuth/权限/多租户/网关 | expert/09-backend-identity | 13架构、18安全、17DBA | 身份首席 |
-| 支付/订单/对账/资损/事务 | expert/10-backend-tx | 17DBA、18安全、19合规 | 事务域首席 |
-| 缓存/搜索/容量读扩展 | expert/11-backend-read | 13架构、16DevOps | 读扩域首席 |
-| 接口/事件/第三方/数据契约 | expert/12-backend-integration | 17DBA、18安全、19合规 | 集成首席 |
-| 架构/ADR/选型/跨域边界 | expert/13-architecture | 相关域首席Agent | 首席架构 |
-| 测试放行/逃逸/合规测试用例 | expert/14-qa-governance | 13架构、18安全、19合规 | 测试治理首席 |
-| 压测/容量/SLO/混沌 | expert/15-qa-perf | 13架构、16DevOps、17DBA | 性能可靠首席 |
-| 发布/回滚/K8s/可观测 | expert/16-devops-sre | 13架构、17DBA、18安全、14QA | DevOps首席 |
-| 数据库/ETL/脱敏/备份 | expert/17-dba | 12集成、18安全、19合规 | DBA首席 |
-| 漏洞/SAST/威胁建模/等保技术 | expert/18-security | 13架构、16DevOps、17DBA | 安全首席 |
-| PIA/个保/跨境/等保密评 | expert/19-compliance | 18安全、17DBA、13架构、14QA | 合规首席/个保负责人 |
-| 文档/ADR归档/Runbook/审计证据 | expert/20-docs | 13架构、18安全、19合规 | 文档首席 |
+| 新需求/需求变更/优先级 | expert/01-product | 13架构、03UIUX、14QA、18安全、19合规 | 首席产品 · 陈亦凡 |
+| 排期冲突/里程碑/依赖 | expert/02-pmo | 各域首席Agent | 首席PMO · 林若曦 |
+| 设计稿/体验/无障碍/同意旅程 | expert/03-uiux | 19合规 | 首席UIUX · 沈清和 |
+| Web前端 diff/SSR/BFF/首屏 | expert/04-web | 05组件、06性能安全、16DevOps | 前端Web首席 · 周子墨 |
+| 组件库/跨端/小程序/Monorepo | expert/05-fe-components | 03UIUX、04Web | 组件首席 · 吴景行 |
+| 前端性能/XSS/CSP/第三方SDK | expert/06-fe-perfsec | 04Web、18安全 | 前端性能安全首席 · 郑思远 |
+| iOS diff/机型/商店隐私 | expert/07-ios | 19合规、16DevOps | iOS首席 · 孙嘉树 |
+| Android/Flutter/RN/商店合规 | expert/08-android | 19合规、16DevOps | Android/跨平台首席 · 何见微 |
+| OAuth/权限/多租户/网关 | expert/09-backend-identity | 13架构、18安全、17DBA | 身份首席 · 冯致远 |
+| 支付/订单/对账/资损/事务 | expert/10-backend-tx | 17DBA、18安全、19合规 | 事务域首席 · 蒋澜 |
+| 缓存/搜索/容量读扩展 | expert/11-backend-read | 13架构、16DevOps | 读扩域首席 · 韩深 |
+| 接口/事件/第三方/数据契约 | expert/12-backend-integration | 17DBA、18安全、19合规 | 集成首席 · 唐予安 |
+| 架构/ADR/选型/跨域边界 | expert/13-architecture | 相关域首席Agent | 首席架构 · 曹立言 |
+| 测试放行/逃逸/合规测试用例 | expert/14-qa-governance | 13架构、18安全、19合规 | 测试治理首席 · 许望舒 |
+| 压测/容量/SLO/混沌 | expert/15-qa-perf | 13架构、16DevOps、17DBA | 性能可靠首席 · 邓启明 |
+| 发布/回滚/K8s/可观测 | expert/16-devops-sre | 13架构、17DBA、18安全、14QA | DevOps首席 · 崔明澈 |
+| 数据库/ETL/脱敏/备份 | expert/17-dba | 12集成、18安全、19合规 | DBA首席 · 苏时雨 |
+| 漏洞/SAST/威胁建模/等保技术 | expert/18-security | 13架构、16DevOps、17DBA | 安全首席 · 罗承嗣 |
+| PIA/个保/跨境/等保密评 | expert/19-compliance | 18安全、17DBA、13架构、14QA | 合规首席/个保负责人 · 高叙 |
+| 文档/ADR归档/Runbook/审计证据 | expert/20-docs | 13架构、18安全、19合规 | 文档首席 · 萧云衢 |
 
 # 工作流
 1. 读取事项输入，识别类型（多域混合时拆成多个事项，各配一个A）；
