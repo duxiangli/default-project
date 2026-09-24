@@ -28,10 +28,11 @@
 │       └── RACI矩阵.csv                       # 机器可读 RACI
 ├── scripts/
 │   ├── sync-roster.mjs                        # 名册 → 岗位卡/Agent/路由表 同步
-│   └── validate-expert-team.mjs               # 一致性校验：结构/编号/引用/RACI双写/名册
-└── .opencode/agents/                          # ── OpenCode Agent 版 ──
-    ├── router.md                              # 路由Agent：只分诊、不持A，按RACI派单
-    └── expert/                                # 20 个专家子Agent（只读）
+│   └── validate-expert-team.mjs               # 一致性校验：结构/编号/引用/RACI双写/名册/MCP权限
+└── .opencode/                                 # ── OpenCode Agent 版 ──
+    ├── opencode.jsonc                         # MCP 接入样例（Jira+GitLab，默认 disabled）
+    ├── agents/router.md                       # 路由Agent：只分诊、不持A，按RACI派单
+    └── agents/expert/                         # 20 个专家子Agent（只读）
         ├── 01-product.md ... 20-docs.md
 ```
 
@@ -61,8 +62,20 @@
 ### C. 日常维护
 
 - 改动任何岗位定义（岗位卡/OpenCode Agent/RACI）后，运行一致性校验：
-  `node scripts/validate-expert-team.mjs`（校验编号、frontmatter、路由引用、命名对应、RACI 双写一致）。
+  `node scripts/validate-expert-team.mjs`（校验编号、frontmatter、路由引用、命名对应、RACI 双写一致、名册、MCP 权限）。
 - 生产/个保/等保/安全放行均走人工签批，Agent 只出建议；跨域争议交技术治理委员会。
+
+### D. 接入 Jira / GitLab（可选，样例已就绪）
+
+样例配置在 `.opencode/opencode.jsonc`（`mcp.servers.gitlab/jira`），**默认 disabled**，不影响未接入时启动。启用三步：
+
+1. 配好环境变量（一律用 `{env:...}` 代入，**严禁把明文密钥写进 jsonc**）：
+   - GitLab：`GITLAB_PERSONAL_ACCESS_TOKEN`、`GITLAB_API_URL`；
+   - Jira：`JIRA_URL`、`JIRA_EMAIL`、`JIRA_API_TOKEN`（命令为社区样例 `sooperset/mcp-atlassian`，命令与变量以你所选服务器文档为准；server 名保持 `jira` 即可不动 Agent 权限）。
+2. 把对应 server 的 `"disabled": true` 改成 `false`，重启 OpenCode，`opencode mcp list` 应显示 `connected`；
+3. 用法示例：`让 expert/18-security 评审 MR !123 的改动`、`让 expert/14-qa-governance 拉取 Jira 需求清单核对测试策略`。
+
+**只读保证**：专家 Agent 的 permissions 只放行 `gitlab_/jira_` 的 `get_*/list_*/search_*`——即使服务器暴露建单/评论等写工具，也在 Agent 层被默认 `deny *` 兜底拦下（校验脚本第 9 节强制检查）。
 
 > 路由 Agent 与专家 Agent 的详细说明见 `.opencode/agents/` 下各文件头注释与正文「权威口径」段。
 

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // ─────────────────────────────────────────────────────────────
+  // 专家团 MCP 工具接入（样例版，默认全部 disabled）
+  //
+  // 启用方式：
+  //   1) 配好对应环境变量（见各 server 的 {env:...}，不要把明文密钥写进本文件）；
+  //   2) 把对应 server 的 "disabled": true 删掉或改 false；
+  //   3) 重启 OpenCode，`opencode mcp list` 应显示 connected 后再用。
+  //
+  // 只读强制（关键）：各专家Agent 的 permissions 里只放行 <server>_get_* / _list_* / _search_*
+  //   ——即使服务器暴露了建单/评论等写工具，也会被 Agent 的 deny-* 兜底拦下。
+  // 工具名前缀 = server 名（gitlab_* / jira_*）；改名需同步改各 Agent 权限与校验脚本。
+  // ─────────────────────────────────────────────────────────────
+  "mcp": {
+    "servers": {
+      // GitLab：官方参考服务器。导出 MR diff / issue / 文件内容，配合权限层只读。
+      "gitlab": {
+        "type": "local",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-gitlab"],
+        "environment": {
+          "GITLAB_PERSONAL_ACCESS_TOKEN": "{env:GITLAB_PERSONAL_ACCESS_TOKEN}",
+          "GITLAB_API_URL": "{env:GITLAB_API_URL}"
+        },
+        "disabled": true
+      },
+      // Jira：社区样例（Docker 版 sooperset/mcp-atlassian）。
+      //   Jira 没有官方参考服务器，命令与环境变量请按团队所选服务器文档核对后替换；
+      //   建议 server 名保持 "jira"，这样各 Agent 权限里的 jira_* 规则无需改动。
+      "jira": {
+        "type": "local",
+        "command": ["docker", "run", "--rm", "-i", "sooperset/mcp-atlassian"],
+        "environment": {
+          "MCP_ATLASSIAN_INSTANCE_URL": "{env:JIRA_URL}",
+          "MCP_ATLASSIAN_EMAIL": "{env:JIRA_EMAIL}",
+          "MCP_ATLASSIAN_API_TOKEN": "{env:JIRA_API_TOKEN}"
+        },
+        "disabled": true
+      }
+    }
+  }
+}

@@ -15,6 +15,24 @@ permissions:
   - action: grep
     resource: "**"
     effect: allow
+  - action: gitlab_get_*
+    resource: "*"
+    effect: allow
+  - action: gitlab_list_*
+    resource: "*"
+    effect: allow
+  - action: gitlab_search_*
+    resource: "*"
+    effect: allow
+  - action: jira_get_*
+    resource: "*"
+    effect: allow
+  - action: jira_list_*
+    resource: "*"
+    effect: allow
+  - action: jira_search_*
+    resource: "*"
+    effect: allow
 ---
 
 # 角色

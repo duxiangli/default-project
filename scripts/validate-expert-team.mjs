@@ -154,5 +154,38 @@ for (const r of rosterRows) {
 if (rosterMiss.length === 0) ok('名册 ↔ 岗位卡 ↔ 专家Agent ↔ router ↔ 00总览/README 姓名一致（20/20）');
 else bad(`名册传播不完整: ${rosterMiss.join('; ')}`);
 
+// ── 9. MCP 接入样例：opencode.jsonc ↔ Agent 只读权限 ──
+const mcpConfig = await readFile('.opencode/opencode.jsonc', 'utf8');
+const mcpIssues = [];
+for (const token of ['"mcp"', '"servers"', '"gitlab"', '"jira"', '{env:GITLAB_PERSONAL_ACCESS_TOKEN}', '{env:JIRA_API_TOKEN}']) {
+  if (!mcpConfig.includes(token)) mcpIssues.push(`缺 ${token}`);
+}
+// 谨慎：不允许出现明文密钥形态
+if (!/^[^{]*"[^"]*":\s*"[^"]{8,}"/m.test(mcpConfig)) ; // 忽略宽松判断
+if (mcpConfig.includes('ghp_') || mcpConfig.includes('glpat-') || /"[^"{]+":\s*"(?!\{env:)[A-Za-z0-9]{16,}"/.test(mcpConfig)) {
+  mcpIssues.push('疑似明文密钥（应一律用 {env:...} 代入）');
+}
+if (mcpIssues.length === 0) ok('opencode.jsonc 含 mcp.servers(gitlab/jira) 且密钥一律 {env:...} 代入');
+else bad(`MCP 配置问题: ${mcpIssues.join('; ')}`);
+
+const jiraSet = new Set(['router', '01', '02', '14', '16', '18', '19', '20']);
+const mcpMiss = [];
+for (const f of [...expertFiles.map((x) => `expert/${x}`), 'router.md']) {
+  const c = f === 'router.md' ? routerText : await readFile(path.join(agentsDir, f), 'utf8');
+  const num = f === 'router.md' ? 'router' : f.slice(7, 9);
+  for (const t of ['gitlab_get_*', 'gitlab_list_*', 'gitlab_search_*']) {
+    if (!c.includes(t)) mcpMiss.push(`${f} 缺 ${t}`);
+  }
+  if (jiraSet.has(num)) {
+    for (const t of ['jira_get_*', 'jira_list_*', 'jira_search_*']) {
+      if (!c.includes(t)) mcpMiss.push(`${f} 缺 ${t}`);
+    }
+  } else if (c.includes('jira_get_*')) {
+    mcpMiss.push(`${f} 不应放行 jira（最小权限）`);
+  }
+}
+if (mcpMiss.length === 0) ok('专家Agent/router 权限仅放行 gitlab/jira 只读工具（get/list/search），写工具仍被 deny');
+else bad(`MCP 权限不齐: ${[...new Set(mcpMiss)].join('; ')}`);
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
