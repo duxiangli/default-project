@@ -31,10 +31,9 @@
 │   └── raci/
 │       └── RACI矩阵.csv                       # 机器可读 RACI
 ├── scripts/
-│   ├── autodispatch-watcher.mjs               # 事件驱动：GitLab MR→自主派单（--dry-run/--force-mr/.env）
+│   ├── autodispatch-watcher.mjs               # 本地 git 新提交 → 自主派单（--dry-run/--mock-mr/常驻，零凭据）
 │   ├── sync-roster.mjs                        # 名册 → 岗位卡/Agent/路由表 同步
 │   └── validate-expert-team.mjs               # 一致性校验：结构/编号/引用/RACI双写/名册/MCP/自主派单/审批闭环
-├── .env.example                               # watcher 配置样例（复制为 .env 填写，已 gitignore）
 └── .opencode/                                 # ── OpenCode Agent 版 ──
     ├── opencode.jsonc                         # default_agent=router + MCP 接入样例（默认 disabled）
     ├── agents/router.md                       # 路由Agent：自主分诊派单+审计留痕，只分诊不持A
@@ -48,7 +47,7 @@
 - **一事一 A**：每个跨域活动仅 1 个 Accountable；Agent 只写 R 或 C，不写 A。
 - **默认只读**：Agent 最小权限，写操作按白名单；生产/个保/等保/安全例外一律人工双签。
 - **强制门禁**：需求→开发→测试→性能→安全→合规→发布 7 道门，任一不过不进下一阶段。
-- **自主派单 + 审批闭环**：新会话默认 `router` 接管；输入即自动分诊派单——留痕进 `runbook/派单日志.md`，需签批项自动入 `runbook/待签批清单.md` 队列，人类首席在 `runbook/审批记录.md` 签批归档（证据链：日志 → 队列 → 台账）。可选事件驱动常驻监听（GitLab MR 到达自动评审）。
+- **自主派单 + 审批闭环**：新会话默认 `router` 接管；输入即自动分诊派单——留痕进 `runbook/派单日志.md`，需签批项自动入 `runbook/待签批清单.md` 队列，人类首席在 `runbook/审批记录.md` 签批归档（证据链：日志 → 队列 → 台账）。可选事件驱动：本地仓库新提交自动触发评审（零凭据）。
 
 ## 快速上手
 
@@ -89,7 +88,7 @@
 
 - **会话内自主**：本项目新会话默认由 `router` 接管（`.opencode/opencode.jsonc` 的 `default_agent: router`），任何输入只要可识别为工作事项就自动分诊派单，并汇总「事项分发＋专家建议＋待人类A签批清单」。想绕开就在单个会话切回 `build`。
 - **审计留痕 + 审批闭环**：router 是全体系**唯一**拿到写白名单的 Agent，且仅两个文件——`runbook/派单日志.md`（每次派单留痕，含派单号 `DSP-...`）与 `runbook/待签批清单.md`（需签批项自动入队，只能写「待签批」）；`runbook/审批记录.md` 为人类签批台账，Agent 无权写入（校验脚本第 10/11 节强制）。
-- **事件驱动（可选·无人值守）**：复制 `.env.example` 为 `.env` 填好 `GITLAB_API_URL` / `GITLAB_PERSONAL_ACCESS_TOKEN`（只读 token 即可，`.env` 已 gitignore）。连通性：`node scripts/autodispatch-watcher.mjs --once --dry-run`（只报告不派单）；指定单个 MR 真派单：`--force-mr <项目ID>/<MR IID>`；常驻：`--interval 60`。GitLab 出现新建/更新 MR → 自动创建 router 会话发起自主评审。需要：本机 OpenCode 服务运行中、模型配置支持子 Agent。
+- **事件驱动（可选·本地零凭据）**：`node scripts/autodispatch-watcher.mjs --once --dry-run`（首次运行自动建立基线，只报告不派单）→ 之后 `--once` 跑一轮或 `--interval 60` 常驻。仓库出现**新提交** → 自动创建 router 会话发起自主评审。想不依赖真实提交验证全链路：`--mock-mr=冒烟标题`。需要：本机 OpenCode 服务运行中、模型配置支持子 Agent。
 - **边界不放松**：router 与 20 个专家仍**不占 A、不代签、不放行**；结论一律四态建议，生产/个保/等保/安全高危待人类首席签批，7 道门禁照常校验。
 
 > 路由 Agent 与专家 Agent 的详细说明见 `.opencode/agents/` 下各文件头注释与正文「权威口径」段。
