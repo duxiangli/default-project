@@ -93,6 +93,13 @@
 
 > 路由 Agent 与专家 Agent 的详细说明见 `.opencode/agents/` 下各文件头注释与正文「权威口径」段。
 
+### F. 导出交付包（用于分发/换平台）
+
+- 一键生成可分发的 zip（含跨平台配置包 + OpenCode Agent 版 + 运维脚本 + 导入说明）：
+  `node scripts/export-bundle.mjs` → `dist/专家团交付包-<日期>.zip`（可传日期参数，如 `node scripts/export-bundle.mjs 2026-09-25`）。
+- 脚本纯 Node 实现（fs.cp + 内置 zip 写入器，UTF-8 文件名），规避 PowerShell 中文参数转码与 Compress-Archive 跳过隐藏目录两个已知坑，打包后自动读回解压自检（必需文件 + 内容标志 + CRC）。
+- 包内 `README.md` 为导入说明（源：`docs/交付包-README.md`），两套资产导入路径见其上「快速导入」章节。
+
 ## 20 岗速览
 
 | # | 岗位卡 | 专家Agent（域） | 人类A |

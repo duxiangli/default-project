@@ -6,6 +6,7 @@
 # 运行产物
 node_modules/
 *.log
+dist/
 
 # 系统杂项
 .DS_Store
