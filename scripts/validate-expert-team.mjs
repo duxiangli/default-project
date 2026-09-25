@@ -193,14 +193,29 @@ if (!mcpConfig.includes('"default_agent": "router"')) autoIssues.push('opencode.
 if (!/^  - action: edit$/m.test(routerText)) autoIssues.push('router 缺 edit 写白名单');
 if (!/^  - action: write$/m.test(routerText)) autoIssues.push('router 缺 write 写白名单');
 if (!routerText.includes('docs/expert-team/runbook/派单日志.md')) autoIssues.push('router 缺派单日志引用');
+if (!routerText.includes('docs/expert-team/runbook/待签批清单.md')) autoIssues.push('router 缺待签批清单引用');
+if (!routerText.includes('docs/expert-team/runbook/审批记录.md')) autoIssues.push('router 缺审批记录台账引用');
 if (!routerText.includes('# 自主介入协议')) autoIssues.push('router 缺自主介入协议');
 if (!routerText.includes('# 派单留痕')) autoIssues.push('router 缺派单留痕');
 let dispatchLogText = '';
 try { dispatchLogText = await readFile('docs/expert-team/runbook/派单日志.md', 'utf8'); } catch { autoIssues.push('缺 派单日志.md'); }
 if (dispatchLogText && !dispatchLogText.includes('<!-- dispatch-log-end -->')) autoIssues.push('派单日志缺末尾标记');
 try { await readFile('scripts/autodispatch-watcher.mjs', 'utf8'); } catch { autoIssues.push('缺 scripts/autodispatch-watcher.mjs'); }
-if (autoIssues.length === 0) ok('自主派单：default_agent=router + 留痕写白名单 + 派单日志 + 事件驱动脚本就绪');
+if (autoIssues.length === 0) ok('自主派单：default_agent=router + 双写白名单(派单日志/待签批清单) + 事件驱动脚本就绪');
 else bad(`自主派单配置不齐: ${autoIssues.join('; ')}`);
+
+// ── 11. 审批闭环：待签批清单(router可写队列) / 审批记录(人工台账+模板) / 派单日志单号 ──
+const approvalIssues = [];
+let pendingText = '';
+try { pendingText = await readFile('docs/expert-team/runbook/待签批清单.md', 'utf8'); } catch { approvalIssues.push('缺 待签批清单.md'); }
+if (pendingText && !pendingText.includes('<!-- pending-approval-end -->')) approvalIssues.push('待签批清单缺末尾标记');
+if (pendingText && !/审批单号/.test(pendingText)) approvalIssues.push('待签批清单缺审批单号列');
+let approvalLogText = '';
+try { approvalLogText = await readFile('docs/expert-team/runbook/审批记录.md', 'utf8'); } catch { approvalIssues.push('缺 审批记录.md'); }
+if (approvalLogText && !/(审批单模板|签批结论四态)/.test(approvalLogText)) approvalIssues.push('审批记录缺模板/四态定义');
+if (dispatchLogText && !/派单号/.test(dispatchLogText)) approvalIssues.push('派单日志缺派单号列');
+if (approvalIssues.length === 0) ok('审批闭环：派单日志(派单号) → 待签批清单(router可写队列) → 审批记录(人类台账+审批单模板) 就绪');
+else bad(`审批闭环不齐: ${approvalIssues.join('; ')}`);
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
