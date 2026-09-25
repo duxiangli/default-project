@@ -1,5 +1,8 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  // 自主派单（默认开启）：本项目新会话一律由 router 主 Agent 接管，任何输入自动分诊派单并留痕；
+  // 单个会话想绕开路由，可在该会话把主 Agent 切回 build 等。
+  "default_agent": "router",
   // ─────────────────────────────────────────────────────────────
   // 专家团 MCP 工具接入（样例版，默认全部 disabled）
   //

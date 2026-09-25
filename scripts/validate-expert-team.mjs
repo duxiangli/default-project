@@ -187,5 +187,20 @@ for (const f of [...expertFiles.map((x) => `expert/${x}`), 'router.md']) {
 if (mcpMiss.length === 0) ok('专家Agent/router 权限仅放行 gitlab/jira 只读工具（get/list/search），写工具仍被 deny');
 else bad(`MCP 权限不齐: ${[...new Set(mcpMiss)].join('; ')}`);
 
+// ── 10. 自主派单：default_agent / router 留痕白名单 / 派单日志 / 事件驱动脚本 ──
+const autoIssues = [];
+if (!mcpConfig.includes('"default_agent": "router"')) autoIssues.push('opencode.jsonc 缺 default_agent=router');
+if (!/^  - action: edit$/m.test(routerText)) autoIssues.push('router 缺 edit 写白名单');
+if (!/^  - action: write$/m.test(routerText)) autoIssues.push('router 缺 write 写白名单');
+if (!routerText.includes('docs/expert-team/runbook/派单日志.md')) autoIssues.push('router 缺派单日志引用');
+if (!routerText.includes('# 自主介入协议')) autoIssues.push('router 缺自主介入协议');
+if (!routerText.includes('# 派单留痕')) autoIssues.push('router 缺派单留痕');
+let dispatchLogText = '';
+try { dispatchLogText = await readFile('docs/expert-team/runbook/派单日志.md', 'utf8'); } catch { autoIssues.push('缺 派单日志.md'); }
+if (dispatchLogText && !dispatchLogText.includes('<!-- dispatch-log-end -->')) autoIssues.push('派单日志缺末尾标记');
+try { await readFile('scripts/autodispatch-watcher.mjs', 'utf8'); } catch { autoIssues.push('缺 scripts/autodispatch-watcher.mjs'); }
+if (autoIssues.length === 0) ok('自主派单：default_agent=router + 留痕写白名单 + 派单日志 + 事件驱动脚本就绪');
+else bad(`自主派单配置不齐: ${autoIssues.join('; ')}`);
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

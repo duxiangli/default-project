@@ -24,14 +24,17 @@
 │   ├── roster/                                # 首席名册（正式落聘版，单一事实源）
 │   │   ├── 首席名册.md
 │   │   └── 首席名册.csv
+│   ├── runbook/                               # 自主派单审计留痕（router 唯一写白名单）
+│   │   └── 派单日志.md
 │   └── raci/
 │       └── RACI矩阵.csv                       # 机器可读 RACI
 ├── scripts/
+│   ├── autodispatch-watcher.mjs               # 事件驱动：GitLab MR→自动起 router 会话派单
 │   ├── sync-roster.mjs                        # 名册 → 岗位卡/Agent/路由表 同步
-│   └── validate-expert-team.mjs               # 一致性校验：结构/编号/引用/RACI双写/名册/MCP权限
+│   └── validate-expert-team.mjs               # 一致性校验：结构/编号/引用/RACI双写/名册/MCP/自主派单
 └── .opencode/                                 # ── OpenCode Agent 版 ──
-    ├── opencode.jsonc                         # MCP 接入样例（Jira+GitLab，默认 disabled）
-    ├── agents/router.md                       # 路由Agent：只分诊、不持A，按RACI派单
+    ├── opencode.jsonc                         # default_agent=router + MCP 接入样例（默认 disabled）
+    ├── agents/router.md                       # 路由Agent：自主分诊派单+审计留痕，只分诊不持A
     └── agents/expert/                         # 20 个专家子Agent（只读）
         ├── 01-product.md ... 20-docs.md
 ```
@@ -42,6 +45,7 @@
 - **一事一 A**：每个跨域活动仅 1 个 Accountable；Agent 只写 R 或 C，不写 A。
 - **默认只读**：Agent 最小权限，写操作按白名单；生产/个保/等保/安全例外一律人工双签。
 - **强制门禁**：需求→开发→测试→性能→安全→合规→发布 7 道门，任一不过不进下一阶段。
+- **自主派单**：本项目新会话默认由 `router` 接管，任何输入自动分诊派单并在 `docs/expert-team/runbook/派单日志.md` 审计留痕；可选事件驱动常驻监听（GitLab MR 到达自动评审）。
 
 ## 快速上手
 
@@ -55,7 +59,7 @@
 ### B. OpenCode
 
 - 主会话内直接说：`把当前改动交给 expert/18-security 评审`、`让路由Agent按RACI派单评审这次需求`、`让 expert/14-qa-governance 检查合规测试用例（同意/注销/导出/保留）缺口`。
-- 也可把会话主 Agent 切到 `router`（路由），按 RACI 自动派单给 20 个专家子 Agent。
+- 新会话**默认就是 `router`**（`default_agent` 已启用）：输入即自动分诊派单并审计留痕；想绕开路由时在单个会话里切回 `build` 等。
 - 所有专家 Agent 均默认**只读**（read/glob/grep），安全/合规/架构/iOS/Android/前端性能安全 6 岗额外开放 web 检索（只读）；不做任何写操作。系统提示词具备「不编造、无工具数据不输出指标、高风险只出建议并升级」等约束。
 - 提示词中「公司」为通用占位，无需替换；跨平台岗位卡中才是 `{公司}` 模板变量。
 
@@ -76,6 +80,13 @@
 3. 用法示例：`让 expert/18-security 评审 MR !123 的改动`、`让 expert/14-qa-governance 拉取 Jira 需求清单核对测试策略`。
 
 **只读保证**：专家 Agent 的 permissions 只放行 `gitlab_/jira_` 的 `get_*/list_*/search_*`——即使服务器暴露建单/评论等写工具，也在 Agent 层被默认 `deny *` 兜底拦下（校验脚本第 9 节强制检查）。
+
+### E. 自主派单（默认开启）
+
+- **会话内自主**：本项目新会话默认由 `router` 接管（`.opencode/opencode.jsonc` 的 `default_agent: router`），任何输入只要可识别为工作事项就自动分诊派单，并汇总「事项分发＋专家建议＋待人类A签批清单」。想绕开就在单个会话切回 `build`。
+- **审计留痕**：router 是全体系**唯一**拿到写白名单的 Agent——只能往 `docs/expert-team/runbook/派单日志.md` 追加记录（格式见文件头）。其余一切写入仍被 `deny`（校验脚本第 10 节强制）。
+- **事件驱动（可选·无人值守）**：`node scripts/autodispatch-watcher.mjs --once`（连通性测试）或 `--interval 60`（常驻）。GitLab 出现新建/更新 MR → 自动创建 router 会话发起自主评审。需要：`GITLAB_PERSONAL_ACCESS_TOKEN`、本机 OpenCode 服务运行中、模型配置支持子 Agent。
+- **边界不放松**：router 与 20 个专家仍**不占 A、不代签、不放行**；结论一律四态建议，生产/个保/等保/安全高危待人类首席签批，7 道门禁照常校验。
 
 > 路由 Agent 与专家 Agent 的详细说明见 `.opencode/agents/` 下各文件头注释与正文「权威口径」段。
 
