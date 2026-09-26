@@ -1,0 +1,16 @@
+﻿路径模式,风险等级,强制加派专家,强制门禁,判定说明
+src/auth/|^auth/|login|token|session|oauth|jwt|permission|rbac|acl,高,expert/09-backend-identity(R);expert/18-security(C),门禁5-安全,认证授权面改动：身份与安全双审，缺一不得进测试
+pay|order|billing|refund|settle|invoice|wallet|amount|price|coupon,高,expert/10-backend-tx(R);expert/18-security(C);expert/17-dba(C),门禁3+门禁5,资金订单面改动：资损/幂等/对账必须过，测试与安全双门禁
+migration|migrations|schema|ddl|flyway|liquibase|alembic,高,expert/17-dba(R);expert/13-architecture(C),门禁7-发布,数据迁移不可逆：必须带回滚预案与灰度证据
+\.env|secret|credential|keystore|values|helm|terraform|k8s|docker|deploy,高,expert/18-security(R);expert/16-devops-sre(C),门禁5+门禁7,配置密钥与编排面：按高危处理，密钥类一律人工确认
+pii|personal.?info|privacy|consent|dsar|跨境|cross.?border,高,expert/19-compliance(R);expert/18-security(C),门禁6-合规,个人信息处理变更：需 PIA 与用户权利影响评估
+\.github/workflows/|jenkinsfile|gitlab-ci|\.gitlab-ci,高,expert/16-devops-sre(R);expert/18-security(C),门禁5+门禁7,CI 流水线即供应链攻击面：变更需安全与 SRE 双审
+api/|openapi|swagger|\.proto|graphql|contract|event|webhook|kafka|rabbitmq|topic,中,expert/12-backend-integration(R);expert/13-architecture(C),门禁2-开发,接口与事件契约变更：需数据契约与兼容性评审
+sql|query|index|redis|cache|elastic|opensearch|search,中,expert/11-backend-read(R);expert/17-dba(C),门禁4-性能,查询缓存与索引面：需容量/索引/慢查询评估
+ios/|android/|flutter|\.dart$|\.swift$|\.kt$|react-native|app.?store,中,expert/07-ios;expert/08-android;expert/19-compliance(C),门禁6-合规,双端按对应首席评审，合规与商店规则必须过
+component|storybook|monorepo|packages/|package\.json|pnpm-workspace,中,expert/05-fe-components(R),门禁3-测试,组件库与 Monorepo 变更：需组件版本与破改影响评估
+test|spec|e2e|coverage|playwright|cypress,中,expert/14-qa-governance(C),门禁3-测试,测试资产变更：需同步测试策略与逃逸率口径
+perf|benchmark|load.?test|slo|latency|throughput,中,expert/15-qa-perf(C),门禁4-性能,性能资产变更：需 SLO 与容量重算
+package-lock\.json|yarn\.lock|pnpm-lock|go\.mod|requirements\.txt|pom\.xml,中,expert/18-security(C);expert/06-fe-perfsec(C),门禁5-安全,依赖变更：SCA 漏洞与包体/首屏影响双查
+release|version|rollback|deploy-plan,中,expert/16-devops-sre(C);expert/02-pmo(C),门禁7-发布,发布相关变更：需错误预算与回滚预案复核
+readme|^docs/|\.md$|adr|runbook|changelog,低,expert/20-docs(C),门禁7-发布,文档面变更：需归档与证据链接一致性

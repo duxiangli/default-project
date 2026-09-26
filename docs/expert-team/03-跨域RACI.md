@@ -20,7 +20,7 @@
 | 事项 | A | R | C | I |
 | --- | --- | --- | --- | --- |
 | 需求范围 | 产品 | 产品Agent/产品 | 架构/各域/UI/QA/安全/合规 | 全员 |
-| 排期与里程碑 | PMO | PMO | 产品/各首席 | 治理委 |
+| 排期与里程碑 | PMO | PMO | 产品/各首席 | 技术治理委员会 |
 | 总体架构/ADR/选型 | 架构 | 各首席 | 产品/安全/DBA/DevOps/合规 | PMO/QA |
 | Web前端 | 前端Web | 前端Web Agent/人 | UI/BFF/性能前端/DevOps | QA |
 | 组件/跨端 | 组件首席 | 组件Agent | UI/Web/业务前端 | QA/DevOps |

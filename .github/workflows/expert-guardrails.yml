@@ -1,0 +1,37 @@
+name: expert-guardrails
+
+# 专家团自治门禁：每次 push / PR 自动跑确定性检查（无需模型、无需凭据）
+# 注意：这里只做「确定性校验 + 门禁卡口」，不调用模型、不做签批——签批永远由人类完成。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: ① 体系一致性校验（14 节：结构/引用/RACI 逐格/名册/门禁阈值/术语/自动化资产）
+        run: node scripts/validate-expert-team.mjs
+
+      - name: ② 自动化自测（watcher 纯函数与状态机不变量）
+        run: node scripts/selftest.mjs
+
+      - name: ③ 治理契约审计（写白名单精确性/专家只读/无明文密钥/单号三方一致/防回退）
+        run: node scripts/guard-audit.mjs --strict
+
+      - name: ④ 签批闭环结构一致性（未闭环/已闭环/孤儿与台账一致）
+        run: node scripts/approval-sync.mjs --check
+
+      - name: ⑤ 度量看板结构一致性
+        run: node scripts/dispatch-metrics.mjs --check
+
+      - name: ⑥ 签批超期/孤儿卡口（未闭环不算违规）
+        run: node scripts/approval-sync.mjs --strict
