@@ -227,5 +227,8 @@ console.log('\n[11] `opencode run` JSONL 解析 + 「有会话无结论」识别
 
 console.log(`\n结果：${pass} 通过 / ${fails.length} 失败`);
 if (fails.length) { console.log('失败项：'); fails.forEach((f) => console.log('  - ' + f)); }
-await rm(tmp, { recursive: true, force: true });
+// 清理失败不得把绿灯变红灯：Windows 上被 spawn 的子进程句柄可能尚未释放，
+// rm 偶发 EBUSY/EPERM 会抛未捕获异常 → 明明 0 失败却 exit 1（2026-09-26 实测复现）
+try { await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); }
+catch (e) { console.log(`（临时目录清理跳过：${e.code || e.message}）`); }
 process.exit(fails.length ? 1 : 0);
