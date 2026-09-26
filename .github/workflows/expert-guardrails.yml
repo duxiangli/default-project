@@ -37,3 +37,6 @@ jobs:
 
       - name: ⑥ 签批超期/孤儿卡口（未闭环不算违规）
         run: node scripts/approval-sync.mjs --strict
+
+      - name: ⑦ 台账结构体检（锚点位置/空行断表/列数/重复单号）
+        run: node scripts/ledger-doctor.mjs --check

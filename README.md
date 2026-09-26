@@ -117,6 +117,7 @@
 | `scripts/approval-sync.mjs` | 签批闭环同步：生成 `runbook/签批状态视图.md`（积压/账龄/超期/孤儿签批） | `node scripts/approval-sync.mjs` `--check` `--strict` |
 | `scripts/dispatch-metrics.mjs` | 度量看板：四态分布/严重度/采纳率/闭环时长/数据质量，算不出的显式标注 | `node scripts/dispatch-metrics.mjs` `--check` |
 | `scripts/guard-audit.mjs` | 治理契约审计：写白名单精确性、专家只读、无明文密钥、单号三方一致、加固防回退 | `node scripts/guard-audit.mjs --strict` |
+| `scripts/ledger-doctor.mjs` | **派单后自检闭环**：台账结构体检 + 自动修复（锚点错位/缺列/空行断表/重复单号）；watcher 每次派单后自动 `--fix`，CI 用 `--check` | `node scripts/ledger-doctor.mjs --check` |
 | `.github/workflows/expert-guardrails.yml` | CI：每次 push/PR 自动跑上述五项，红了不许合并 | 自动 |
 
 **v2 关键修复**（对应 `DSP-20260925-1221/1222/1223` 三笔待签批意见）：

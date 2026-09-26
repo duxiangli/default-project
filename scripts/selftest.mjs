@@ -14,6 +14,7 @@ import {
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict } from './lib/runbook.mjs';
+import { analyze, repair, SPECS } from './ledger-doctor.mjs';
 
 let pass = 0;
 const fails = [];
@@ -292,6 +293,54 @@ console.log('\n[13] 四态解析顺序回归（expert/20-docs 在 DSP-20260927-0
   eq(classifyVerdict('建议批准/低').severity, '低', '组合表述同时抽严重度');
   eq(classifyVerdict('').verdict, null, '空输入不猜');
   eq(classifyVerdict('配置就绪').verdict, null, '无关文本不臆断四态');
+}
+
+console.log('\n[14] 台账医生：检测 + 自动修复 + 幂等（派单后自检闭环）');
+{
+  const SPEC = { rel: 't', row: /^\| DSP-/, head: '| 派单号', cols: 9, anchor: '<!-- dispatch-log-end -->' };
+  const row = (id, n = 9) => `| ${id} |` + Array.from({ length: n - 1 }, () => ' x ').join('|') + '|';
+  const good = `# 派单日志\n\n| 派单号 | a | b | c | d | e | f | g | h |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${row('DSP-1')}\n${row('DSP-2')}\n\n<!-- dispatch-log-end -->\n`;
+
+  eq(analyze(good, SPEC).issues.length, 0, '规范台账无问题');
+
+  // ① 锚点插在表格中间（router 最常犯，且会静默丢后续记录）
+  const badAnchor = `# 派单日志\n\n| 派单号 | a | b | c | d | e | f | g | h |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${row('DSP-1')}\n<!-- dispatch-log-end -->\n${row('DSP-2')}\n`;
+  truthy(analyze(badAnchor, SPEC).issues.some((i) => i.kind === 'anchor-misplaced'), '检出锚点错位');
+  const fixed1 = repair(badAnchor, SPEC);
+  truthy(fixed1.applied.some((a) => a.includes('锚点')), '修复锚点到末尾');
+  eq(analyze(fixed1.text, SPEC).issues.length, 0, '修复后无问题');
+
+  // ② 数据行缺列
+  const short = `# 派单日志\n\n| 派单号 | a | b | c | d | e | f | g | h |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${row('DSP-1', 8)}\n\n<!-- dispatch-log-end -->\n`;
+  truthy(analyze(short, SPEC).issues.some((i) => i.kind === 'col-count'), '检出列数不足');
+  const fixed2 = repair(short, SPEC);
+  truthy(fixed2.applied.some((a) => a.includes('补齐缺失列')), '修复补齐缺失列');
+  eq(analyze(fixed2.text, SPEC).issues.length, 0, '补列后无问题');
+  truthy(fixed2.text.includes('| —'), '缺失值填「—」而非臆造四态/需签批');
+
+  // ③ 表格内空行（把表断成两段，解析器只读第一段）
+  const blank = `# 派单日志\n\n| 派单号 | a | b | c | d | e | f | g | h |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${row('DSP-1')}\n\n${row('DSP-2')}\n\n<!-- dispatch-log-end -->\n`;
+  truthy(analyze(blank, SPEC).issues.some((i) => i.kind === 'blank-in-table'), '检出表格内空行');
+  eq(analyze(repair(blank, SPEC).text, SPEC).issues.length, 0, '移除空行后无问题');
+
+  // ④ 单号重复
+  const dup = `# 派单日志\n\n| 派单号 | a | b | c | d | e | f | g | h |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${row('DSP-1')}\n${row('DSP-1')}\n\n<!-- dispatch-log-end -->\n`;
+  truthy(analyze(dup, SPEC).issues.some((i) => i.kind === 'dup-serial'), '检出重复单号');
+  const fixedDup = repair(dup, SPEC);
+  eq((fixedDup.text.match(/\| DSP-1 \|/g) || []).length, 1, '去重后仅保留一条');
+  eq(analyze(fixedDup.text, SPEC).issues.length, 0, '去重后无问题');
+
+  // 幂等：已规范的台账再修一次不应有任何改动
+  const again = repair(good, SPEC);
+  eq(again.applied.length, 0, '对规范台账无操作（幂等）');
+  eq(again.text, good, '幂等：文本不变');
+  const twice = repair(fixed1.text, SPEC);
+  eq(twice.applied.length, 0, '修复结果再修复仍无操作');
+
+  // 缺锚点 / 无数据：报但不臆造
+  const noAnchor = `# 派单日志\n\n| 派单号 | a | b | c | d | e | f | g | h |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${row('DSP-1')}\n`;
+  truthy(analyze(noAnchor, SPEC).issues.some((i) => i.kind === 'no-anchor'), '检出缺锚点');
+  eq(analyze('# 空文件\n', SPEC).issues.some((i) => i.kind === 'no-data'), true, '检出无数据行');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fails.length} 失败`);

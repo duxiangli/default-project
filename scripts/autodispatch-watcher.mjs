@@ -400,6 +400,33 @@ async function api(cli, args) {
   try { return JSON.parse(text); } catch { return text; }
 }
 
+/**
+ * 派单后自检：体检台账结构并自动修复可修复项。
+ * router 无命令执行权，无法自检；故由 watcher 在会话结束后立即执行。
+ * 修复不了的问题必须显式告警——绝不静默（router 手写 Markdown 的四类错都会静默丢审计）。
+ */
+async function ledgerDoctor(flags) {
+  const doctor = join(ROOT, 'scripts', 'ledger-doctor.mjs');
+  try {
+    const r = await runCli(process.execPath, [doctor, flags.fixLedger === false ? '--check' : '--fix'],
+      { cwd: ROOT, timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+    const out = (r.stdout || '') + (r.stderr || '');
+    if (r.code === 0) {
+      const fixed = out.split(/\r?\n/).filter((l) => l.includes('已修'));
+      if (fixed.length) log(`  台账自检：${fixed.map((l) => l.replace(/^\W+/, '')).join('；')}`);
+      else log('  台账自检：结构正常');
+      return { ok: true, output: out };
+    }
+    log('[!] 台账自检未通过（已尝试自动修复，仍有问题）：');
+    for (const l of out.split(/\r?\n/).filter((x) => x.includes('- [')).slice(0, 6)) log(`    ${l.trim()}`);
+    log('    这些问题会让派单记录被解析器忽略，等于审计链断裂；请人工检查三张台账');
+    return { ok: false, output: out };
+  } catch (e) {
+    log(`[!] 台账自检无法执行: ${String(e.message || e).slice(0, 120)}`);
+    return { ok: false, output: '' };
+  }
+}
+
 /** 通道健康检查：最小提示词探活。探不通就不派单，避免把服务楔死 */
 export async function healthCheck(cli, dir, { timeout = 90000 } = {}) {
   const t0 = Date.now();
@@ -479,10 +506,12 @@ async function poll(ctx) {
     log(`→ 事件 [mock] ${sanitizeUntrusted(flags.mockMr)}`);
     try {
       const d = await dispatch(cli, dir, 'smoke', text, flags);
+      const doc = await ledgerDoctor(flags);
       const repo = state.repos[repoKey] || { dispatches: [] };
       repo.dispatches = [...(repo.dispatches || []), {
         at: cur, kind: 'mock', subject: sanitizeUntrusted(flags.mockMr),
         sessionId: d.sessionId, hashes: [], transport: d.transport, conclusion: d.conclusion,
+        ledgerCheck: doc.ok ? 'clean' : 'unrepaired',
       }];
       repo.lastCheck = cur;
       state.repos[repoKey] = repo;
@@ -591,11 +620,13 @@ async function poll(ctx) {
 
   try {
     const d = await dispatch(cli, dir, plan.newestHash.slice(0, 8), text, flags);
+    const doc = await ledgerDoctor(flags);   // ← 写完立刻自检+修复（router 自身无权跑命令）
     const repo = state.repos[repoKey];
     repo.lastHead = plan.advanceToHash; // 只推进到本批最旧一条 → 无缺口
     repo.breaker = breakerUpdate(repo.breaker, { type: 'dispatch-ok' });
     repo.dispatches = [...(repo.dispatches || []), {
       at: cur, kind: 'git', sessionId: d.sessionId, transport: d.transport, conclusion: d.conclusion,
+      ledgerCheck: doc.ok ? 'clean' : 'unrepaired',
       hashes: plan.take.map((c) => c.hash), advanceTo: plan.advanceToHash, overflow: plan.overflow,
       files: files.slice(0, MAX_FILES), summary: d.summary || '',
     }];
