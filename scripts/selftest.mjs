@@ -10,7 +10,8 @@ import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import {
   parseFlags, sanitizeUntrusted, buildUntrustedBlock, planIncremental,
-  REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream, STATE_VERSION,
+  REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
+  breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
 } from './autodispatch-watcher.mjs';
 
 let pass = 0;
@@ -223,6 +224,58 @@ console.log('\n[11] `opencode run` JSONL 解析 + 「有会话无结论」识别
   eq(parseFlags(['--transport=run']).transport, 'run', '--transport 默认 run');
   truthy(parseFlags(['--transport=bogus']).warnings.length === 1, '非法 transport 进告警');
   eq(parseFlags(['--dispatch-timeout', '30']).dispatchTimeout, 30000, '派单超时参数换算为毫秒');
+}
+
+console.log('\n[12] 熔断状态机（连续失败自动熔断，防无限重试毒化服务）');
+{
+  // 正常路径
+  eq(breakerAllows(undefined), true, '初始状态允许派单');
+  let b = breakerUpdate(undefined, { type: 'dispatch-ok' });
+  eq(b.state, 'closed', '成功后保持 closed');
+  eq(b.consecutiveFailures, 0, '成功清零失败计数');
+
+  // 连续失败到阈值才熔断
+  b = breakerUpdate(b, { type: 'dispatch-fail', error: 'e1' });
+  eq([b.state, breakerAllows(b)], ['closed', true], '失败 1 次不熔断');
+  b = breakerUpdate(b, { type: 'dispatch-fail', error: 'e2' });
+  eq([b.state, breakerAllows(b)], ['closed', true], '失败 2 次不熔断（阈值 3）');
+  b = breakerUpdate(b, { type: 'dispatch-fail', error: '通道楔死' });
+  eq([b.state, breakerAllows(b)], ['open', false], '失败 3 次熔断，停止派单');
+  eq(b.trips, 1, '记录熔断次数');
+  truthy(/通道楔死/.test(b.lastError), '记录最近错误原文');
+
+  // 熔断中：探活不通则保持熔断（这是防"反复毒化"的关键）
+  b = breakerUpdate(b, { type: 'health-fail' });
+  eq([b.state, b.healthStreak], ['open', 0], '探活不通 → 保持熔断且健康计数归零');
+  eq(breakerAllows(b), false, '探活不通时仍禁止派单');
+
+  // 熔断中：连续探活通过才恢复
+  b = breakerUpdate(b, { type: 'health-ok' });
+  eq([b.state, b.healthStreak], ['open', 1], '探活通过 1 次还不恢复（需连续 2 次）');
+  eq(breakerAllows(b), false, '仅 1 次探活通过仍不派单（防抖动）');
+  b = breakerUpdate(b, { type: 'health-ok' });
+  eq([b.state, breakerAllows(b)], ['closed', true], '连续 2 次探活通过 → 自动恢复');
+  eq(b.consecutiveFailures, 0, '恢复后失败计数清零');
+  eq(b.lastError, null, '恢复后清除错误');
+
+  // 闭环场景：失败→熔断→健康→恢复→再失败→再熔断
+  b = breakerUpdate(undefined, { type: 'dispatch-fail', error: 'x' });
+  b = breakerUpdate(b, { type: 'dispatch-fail', error: 'x' });
+  b = breakerUpdate(b, { type: 'dispatch-fail', error: 'x' });
+  eq(b.state, 'open', '场景：首轮熔断');
+  b = breakerUpdate(b, { type: 'health-ok' });
+  b = breakerUpdate(b, { type: 'health-ok' });
+  eq(b.state, 'closed', '场景：恢复');
+  b = breakerUpdate(b, { type: 'dispatch-fail', error: 'y' });
+  b = breakerUpdate(b, { type: 'dispatch-fail', error: 'y' });
+  b = breakerUpdate(b, { type: 'dispatch-fail', error: 'y' });
+  eq([b.state, b.trips], ['open', 2], '场景：二次熔断，计数累加');
+
+  // 自定义阈值
+  const strict = breakerUpdate(undefined, { type: 'dispatch-fail', error: 'z' }, { threshold: 1 });
+  eq(strict.state, 'open', 'threshold=1 时首次失败即熔断');
+  truthy(parseFlags(['--reset-breaker']).resetBreaker, '--reset-breaker 参数解析');
+  eq(BREAKER_DEFAULTS.threshold, 3, '默认阈值 3');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fails.length} 失败`);

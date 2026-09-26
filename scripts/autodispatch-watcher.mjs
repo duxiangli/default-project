@@ -60,7 +60,7 @@ export function parseFlags(argv) {
   const f = {
     once: false, dryRun: false, interval: 60, mockMr: null, projectDir: null, statePath: null,
     maxCommits: 50, resetBaseline: false, replayLast: false, json: false, warnings: [],
-    transport: 'run', dispatchTimeout: DISPATCH_TIMEOUT_MS, healthOnly: false,
+    transport: 'run', dispatchTimeout: DISPATCH_TIMEOUT_MS, healthOnly: false, resetBreaker: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -81,6 +81,7 @@ export function parseFlags(argv) {
       case '--project-dir': f.projectDir = String(next() ?? '') || null; break;
       case '--state': f.statePath = String(next() ?? '') || null; break;
       case '--health': f.healthOnly = true; break;
+      case '--reset-breaker': f.resetBreaker = true; break;
       case '--transport': {
         const v = String(next() ?? '');
         if (v !== 'run' && v !== 'api') f.warnings.push(`--transport 只能是 run|api，收到 ${v}`);
@@ -141,6 +142,61 @@ ${untrusted}
 4. 按 #派单留痕 追加审计记录（派单号 DSP-YYYYMMDD-HHMM）；需签批项按 #待签批清单 入队（AP 号一一对应，状态只能写「待签批」）；
 5. 输出：事项分发摘要 + 专家建议汇总（四态＋严重度）＋ 待人类A签批清单 + 7 道门禁状态；
 6. 边界不变：只出建议，不占A、不代签、不放行；router 与专家的可写文件仍仅「派单日志.md」「待签批清单.md」。`;
+
+/* ══════════════ 熔断（纯函数状态机，CI 无模型可测） ══════════════ */
+
+export const BREAKER_DEFAULTS = { threshold: 3, streakNeeded: 2, healthTimeout: 90000 };
+
+/**
+ * 熔断状态机：
+ *   closed ──dispatch-fail×N──> open ──health-ok×M──> closed
+ *              ↑                    │
+ *              └──── health-fail ────┘（保持 open，退避加长）
+ * 为什么需要：2026-09-26 事故——派单挂起会把共享后台服务楔死，且不���自愈；
+ * 若无熔断，常驻会以固定间隔无限重试，持续毒化服务。
+ */
+export function breakerUpdate(prev = {}, event = {}, opts = {}) {
+  const { threshold, streakNeeded } = { ...BREAKER_DEFAULTS, ...opts };
+  const b = {
+    state: prev.state || 'closed',
+    consecutiveFailures: prev.consecutiveFailures || 0,
+    healthStreak: prev.healthStreak || 0,
+    lastError: prev.lastError || null,
+    openedAt: prev.openedAt || null,
+    trips: prev.trips || 0,
+  };
+  switch (event.type) {
+    case 'dispatch-ok':
+      return { ...b, state: 'closed', consecutiveFailures: 0, healthStreak: 0, lastError: null, openedAt: null };
+    case 'dispatch-fail':
+      b.consecutiveFailures += 1;
+      b.lastError = String(event.error || 'unknown').slice(0, 200);
+      if (b.consecutiveFailures >= threshold) {
+        b.state = 'open';
+        b.openedAt = new Date().toISOString();
+        b.trips += 1;
+        b.healthStreak = 0;
+      }
+      return b;
+    case 'health-ok':
+      if (b.state !== 'open') return { ...b, state: 'closed', consecutiveFailures: 0 };
+      b.healthStreak += 1;
+      if (b.healthStreak >= streakNeeded) {
+        return { ...b, state: 'closed', consecutiveFailures: 0, healthStreak: 0, openedAt: null, lastError: null };
+      }
+      return b;
+    case 'health-fail':
+      b.healthStreak = 0;
+      return b;
+    default:
+      return b;
+  }
+}
+
+/** 当前是否允许派单 */
+export function breakerAllows(prev = {}) {
+  return (prev.state || 'closed') !== 'open';
+}
 
 /** 分批计划：只派前 maxCommits 条，lastHead 推进到「本批最旧一条」→ 下轮续派，无缺口无重复 */
 export function planIncremental(commits, maxCommits) {
@@ -492,26 +548,52 @@ async function poll(ctx) {
 
   log(`→ 事件 新提交 ${plan.take.length} 条（${plan.take.map((c) => c.hash.slice(0, 8)).join(',')}）变更文件 ${files.length} 个`);
 
-  // 派单前探活：通道不通就不派单（曾因挂起把共享服务楔死，且不能自愈）
+  // 派单前探活 + 熔断闸门
+  const repo0 = state.repos[repoKey];
+  if (flags.resetBreaker) {
+    repo0.breaker = breakerUpdate(repo0.breaker, { type: 'dispatch-ok' });
+    await saveState(state, flags);
+    log(`熔断器已人工复位（--reset-breaker）`);
+  }
+  if (!breakerAllows(repo0.breaker)) {
+    // 熔断中：只做低成本探活，连通两次才恢复
+    const h = await healthCheck(cli, dir, { timeout: BREAKER_DEFAULTS.healthTimeout });
+    repo0.breaker = breakerUpdate(repo0.breaker, h.ok ? { type: 'health-ok' } : { type: 'health-fail' });
+    repo0.lastCheck = cur;
+    await saveState(state, flags);
+    if (breakerAllows(repo0.breaker)) {
+      log(`✅ 熔断自动恢复（连续 ${BREAKER_DEFAULTS.streakNeeded} 次探活通过），恢复派单`);
+    } else {
+      log(`⛔ 熔断中：已连续失败 ${repo0.breaker.consecutiveFailures} 次，暂停派单以免毒化服务。`
+        + `\n    最近错误：${repo0.breaker.lastError || '-'}`);
+      log(`    探活第 ${repo0.breaker.healthStreak}/${BREAKER_DEFAULTS.streakNeeded} 次（${h.ok ? '通' : '不通'}）；`
+        + '恢复通道后自动重试，或用 --reset-breaker 人工复位');
+      return { ...summary, ok: false, error: 'breaker-open', breaker: repo0.breaker };
+    }
+  }
+
   const h = await healthCheck(cli, dir);
   if (!h.ok) {
     const repo = state.repos[repoKey];
     repo.lastCheck = cur;
-    repo.consecutiveFailures = (repo.consecutiveFailures || 0) + 1;
+    repo.breaker = breakerUpdate(repo.breaker, { type: 'dispatch-fail', error: (h.errors && h.errors[0]) || '通道无响应' });
     await saveState(state, flags);
     log(`[!] 通道探活失败（${h.ms}ms）：${(h.errors && h.errors[0]) || '无响应'} → 本轮不派单（不推进 lastHead）`);
-    log(`    处置：确认桌面版 OpenCode 服务正常（可执行 \`opencode service restart\`）后重试；`
-      + `连续失败 ${repo.consecutiveFailures} 次，建议先用 --health 单独排查`);
-    return { ...summary, ok: false, error: 'channel-unhealthy', healthMs: h.ms };
+    if (!breakerAllows(repo.breaker)) {
+      log(`⛔ 已连续 ${repo.breaker.consecutiveFailures} 次失败 → 熔断，本轮起暂停派单直至通道恢复`);
+    } else {
+      log(`    连续失败 ${repo.breaker.consecutiveFailures}/${BREAKER_DEFAULTS.threshold} 次；`
+        + '可用 --health 单独排查，或确认桌面版服务正常');
+    }
+    return { ...summary, ok: false, error: 'channel-unhealthy', healthMs: h.ms, breaker: repo.breaker };
   }
-  if (h.ms > 30000) log(`  通道探活通过（${h.ms}ms，较慢）`);
-  else log(`  通道探活通过（${h.ms}ms）`);
+  log(`  通道探活通过（${h.ms}ms）`);
 
   try {
     const d = await dispatch(cli, dir, plan.newestHash.slice(0, 8), text, flags);
     const repo = state.repos[repoKey];
     repo.lastHead = plan.advanceToHash; // 只推进到本批最旧一条 → 无缺口
-    repo.consecutiveFailures = 0;
+    repo.breaker = breakerUpdate(repo.breaker, { type: 'dispatch-ok' });
     repo.dispatches = [...(repo.dispatches || []), {
       at: cur, kind: 'git', sessionId: d.sessionId, transport: d.transport, conclusion: d.conclusion,
       hashes: plan.take.map((c) => c.hash), advanceTo: plan.advanceToHash, overflow: plan.overflow,
@@ -522,8 +604,15 @@ async function poll(ctx) {
     log(`poll done：派单 1 次（transport=${d.transport}，结论产出=${d.conclusion}），lastHead→${plan.advanceToHash.slice(0, 8)}${plan.overflow ? `，下轮续派 ${plan.overflow} 条` : ''}`);
     return { ...summary, dispatched: 1, sessionId: d.sessionId, conclusion: d.conclusion, overflow: plan.overflow, hashes: plan.take.map((c) => c.hash) };
   } catch (e) {
+    const repo = state.repos[repoKey];
+    repo.breaker = breakerUpdate(repo.breaker, { type: 'dispatch-fail', error: e.message });
+    repo.lastCheck = cur;
+    await saveState(state, flags);
     log(`[!] 派单失败: ${e.message}（不推进 lastHead，下次轮询重试）`);
-    return { ...summary, ok: false, error: e.message };
+    if (!breakerAllows(repo.breaker)) {
+      log(`⛔ 已连续 ${repo.breaker.consecutiveFailures} 次失败 → 熔断，暂停派单直至通道恢复或 --reset-breaker`);
+    }
+    return { ...summary, ok: false, error: e.message, breaker: repo.breaker };
   }
 }
 

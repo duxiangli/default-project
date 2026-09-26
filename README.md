@@ -92,6 +92,8 @@
   - **传输层默认 `--transport=run`**（`opencode run --agent router`）：这是唯一能正确走模型额度的路径。旧的裸 `api post /api/session` 在免费额度下会**静默建成会话但零产出**（tokens=0、无结论、不报错），已不作为默认。详见 `04-编排与门禁.md` §4.2.1。
   - **判断派单是否真的生效，看台账（`派单日志.md` 是否新增行），不要只看 watcher 自己的日志**——watcher 会显式打印 `结论产出=true/false`。
   - 一次真实派单串多个专家子会话，**耗时可达 10~20 分钟**；`--dispatch-timeout` 默认 900s。通道异常时 `--replay-last --once` 重放。
+  - **三道防线**（2026-09-26 真实事故后加固）：① 统一 `runCli` 关闭子进程 stdin（此前每次派单必挂满超时并楔死共享服务）；② 派单前 `--health` 探活，不通就不派单；③ **连续 3 次失败自动熔断**，熔断期间只探活、连续 2 次通过才自动恢复（`--reset-breaker` 人工复位）。详见 `04-编排与门禁.md` §4.2.2。
+  - **开机自启**：`powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1` 注册计划任务（登录触发、崩溃重试、重复实例忽略）；常驻日志在 `logs\watcher.log`。
 - **边界不放松**：router 与 20 个专家仍**不占 A、不代签、不放行**；结论一律四态建议，生产/个保/等保/安全高危待人类首席签批，7 道门禁照常校验。
 
 > 路由 Agent 与专家 Agent 的详细说明见 `.opencode/agents/` 下各文件头注释与正文「权威口径」段。
