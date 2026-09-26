@@ -40,10 +40,18 @@ export function computeMetrics(book, { days = 30 } = {}) {
   const experts = tally(dispatches.flatMap((d) => `${d.dispatched} ${d.R} ${d.C}`.match(/expert\/[a-z0-9-]+/g) || []).map((s) => s.replace('expert/', '')));
   const humans = tally(dispatches.map((d) => d.humanA.split('·')[0].trim()).filter(Boolean));
 
-  // 签批闭环：采纳率只对「已闭环且两侧四态可解析」的项统计
+  // 签批闭环：采纳率对「已闭环且两侧四态可解析」的项统计。
+  // 只按四态字符串相等判定会把「专家驳回 → 人类有条件批准」误算为未采纳，故分三类：
+  //   一致采纳（四态相同）｜条件采纳（结论不同但审批依据含条件/整改）｜偏离（结论不同且无条件）
   const closedPairs = pendings.filter((p) => p.ap && apIndex.has(p.ap.id));
   const comparable = closedPairs.filter((p) => p.verdict && apIndex.get(p.ap.id).conclusion);
-  const adopted = comparable.filter((p) => p.verdict === apIndex.get(p.ap.id).conclusion);
+  const adoptClass = (p) => {
+    const a = apIndex.get(p.ap.id);
+    if (p.verdict === a.conclusion) return '一致采纳';
+    return /条件|整改|复跑|验证|留档|后关闭|转「?批准/.test(a.basis || '') ? '条件采纳' : '偏离';
+  };
+  const adoptTally = tally(comparable.map(adoptClass));
+  const adopted = (adoptTally['一致采纳'] || 0) + (adoptTally['条件采纳'] || 0);
   const cycleDays = closedPairs
     .map((p) => {
       const a = apIndex.get(p.ap.id);
@@ -69,7 +77,8 @@ export function computeMetrics(book, { days = 30 } = {}) {
     open: open.length,
     maxOpenAge: openAges.length ? Math.max(...openAges) : null,
     avgOpenAge: openAges.length ? (openAges.reduce((a, b) => a + b, 0) / openAges.length).toFixed(1) : null,
-    adoptRate: pct(adopted.length, comparable.length), adopted: adopted.length, comparable: comparable.length,
+    adoptRate: pct(adopted, comparable.length), adopted, comparable: comparable.length,
+    adoptClass: adoptTally,
     avgCycleDays: cycleDays.length ? (cycleDays.reduce((a, b) => a + b, 0) / cycleDays.length).toFixed(1) : null,
     gateHitRate: pct(gateHits.length, total),
     dataQuality: {
@@ -112,7 +121,10 @@ export function renderDashboard(m) {
   L.push(`| 未闭环（待签批） | ${m.open} |`);
   L.push(`| 最长账龄（天） | ${m.maxOpenAge ?? '—'} |`);
   L.push(`| 平均账龄（天） | ${m.avgOpenAge ?? '—'} |`);
-  L.push(`| 建议采纳率（已闭环可比较项） | ${m.adoptRate}（${m.adopted}/${m.comparable}） |`);
+  L.push(`| 建议采纳率（一致+条件采纳） | ${m.adoptRate}（${m.adopted}/${m.comparable}） |`);
+  L.push(`| ├ 一致采纳（四态相同） | ${m.adoptClass['一致采纳'] || 0} |`);
+  L.push(`| ├ 条件采纳（结论不同但带条件） | ${m.adoptClass['条件采纳'] || 0} |`);
+  L.push(`| └ 偏离（结论不同且无条件） | ${m.adoptClass['偏离'] || 0} |`);
   L.push(`| 平均签批闭环时长（天） | ${m.avgCycleDays ?? '—'} |`);
   L.push('');
   L.push('## 5. 专家参与频次');
