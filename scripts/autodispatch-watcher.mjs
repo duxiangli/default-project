@@ -29,7 +29,7 @@
  *
  * 环境变量：AUTODISPATCH_DIR / AUTODISPATCH_STATE / AUTODISPATCH_API_TIMEOUT
  */
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -60,7 +60,7 @@ export function parseFlags(argv) {
   const f = {
     once: false, dryRun: false, interval: 60, mockMr: null, projectDir: null, statePath: null,
     maxCommits: 50, resetBaseline: false, replayLast: false, json: false, warnings: [],
-    transport: 'run', dispatchTimeout: DISPATCH_TIMEOUT_MS,
+    transport: 'run', dispatchTimeout: DISPATCH_TIMEOUT_MS, healthOnly: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -80,6 +80,7 @@ export function parseFlags(argv) {
       case '--mock-mr': f.mockMr = String(next() ?? '') || null; break;
       case '--project-dir': f.projectDir = String(next() ?? '') || null; break;
       case '--state': f.statePath = String(next() ?? '') || null; break;
+      case '--health': f.healthOnly = true; break;
       case '--transport': {
         const v = String(next() ?? '');
         if (v !== 'run' && v !== 'api') f.warnings.push(`--transport 只能是 run|api，收到 ${v}`);
@@ -310,10 +311,51 @@ export function parseRunStream(text) {
   return { sessionId: sid, texts, errors, conclusion };
 }
 
+/**
+ * 统一 CLI 调用：**必须 stdin=ignore**。
+ * 2026-09-26 定位的根因：用 execFile 且不关闭子进程 stdin 时，opencode-cli 会在建会话前
+ * 阻塞读取 stdin，导致每次派单必挂到超时；且第一次挂起会把共享后台服务楔死，
+ * 之后所有 `opencode run`（含最小提示词）全部超时且不能自愈。
+ * 判别实验：execFile 不关 stdin → 75s 超时；关 stdin → 7.6s 成功；spawn+stdin ignore → 6.1s 成功。
+ */
+function runCli(cli, args, { cwd, timeout, maxBuffer = 32 * 1024 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cli, args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let out = "", err = "", size = 0;
+    const cap = maxBuffer;
+    p.stdout.on("data", (d) => { size += d.length; if (size <= cap) out += d; });
+    p.stderr.on("data", (d) => { if (size + d.length <= cap) err += d; });
+    const timer = setTimeout(() => { try { p.kill(); } catch { /* 已退出 */ } }, timeout);
+    p.on("error", (e) => { clearTimeout(timer); reject(e); });
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      const e = new Error(`CLI 退出码 ${code}${code ? `；stderr: ${err.replace(/\s+/g, " ").slice(0, 200)}` : ""}`);
+      e.code = code; e.stdout = out; e.stderr = err; e.timedOut = false;
+      resolve({ code, stdout: out, stderr: err });
+    });
+    // 双保险：即使 stdio 忽略也显式结束 stdin
+    if (p.stdin) p.stdin.end();
+  });
+}
+
 async function api(cli, args) {
-  const out = await exec(cli, ['api', 'post', ...args], { maxBuffer: 8 * 1024 * 1024, timeout: API_TIMEOUT_MS });
-  const text = (out.stdout || '').trim();
+  const r = await runCli(cli, ["api", "post", ...args], { maxBuffer: 8 * 1024 * 1024, timeout: API_TIMEOUT_MS });
+  const text = (r.stdout || '').trim();
   try { return JSON.parse(text); } catch { return text; }
+}
+
+/** 通道健康检查：最小提示词探活。探不通就不派单，避免把服务楔死 */
+export async function healthCheck(cli, dir, { timeout = 90000 } = {}) {
+  const t0 = Date.now();
+  try {
+    const r = await runCli(cli, ["run", "--agent", "build", "--format", "json", "只回一行 PONG"],
+      { cwd: dir, timeout, maxBuffer: 8 * 1024 * 1024 });
+    const p = parseRunStream((r.stdout || "") + (r.stderr || ''));
+    const ok = p.conclusion || p.sessionId;
+    return { ok: Boolean(ok), ms: Date.now() - t0, sessionId: p.sessionId || null, errors: p.errors };
+  } catch (e) {
+    return { ok: false, ms: Date.now() - t0, sessionId: null, errors: [String(e.message || e).slice(0, 200)] };
+  }
 }
 
 /**
@@ -336,17 +378,7 @@ async function dispatch(cli, dir, titleHead, text, flags = {}) {
   }
 
   const args = ['run', '--agent', 'router', '--title', `autodispatch ${titleHead}`, '--format', 'json', text];
-  let r;
-  try {
-    r = await exec(cli, args, { cwd: dir, maxBuffer: 32 * 1024 * 1024, timeout });
-  } catch (e) {
-    // 超时要单独识别：它不代表通道坏了，而是评审没跑完——本轮不算失败结论，等下轮重试
-    if (e.killed || e.signal === 'SIGTERM' || /Command failed|ETIMEDOUT|timed out/i.test(e.message || '')) {
-      throw new Error(`派单超时（${Math.round(timeout / 60000)} 分钟未完成，评审可能仍在服务端继续）。`
-        + '处置：--dispatch-timeout <秒> 调大，或用 --max-commits 拆小批次；本轮不推进 lastHead，下轮自动重试。');
-    }
-    throw e;
-  }
+  const r = await runCli(cli, args, { cwd: dir, timeout });
   const parsed = parseRunStream((r.stdout || '') + (r.stderr || ''));
   if (parsed.sessionId) log(`  session=${parsed.sessionId}`);
   if (parsed.errors.length) log(`  [!] 运行期报错: ${parsed.errors[0]}`);
@@ -459,10 +491,27 @@ async function poll(ctx) {
   }
 
   log(`→ 事件 新提交 ${plan.take.length} 条（${plan.take.map((c) => c.hash.slice(0, 8)).join(',')}）变更文件 ${files.length} 个`);
+
+  // 派单前探活：通道不通就不派单（曾因挂起把共享服务楔死，且不能自愈）
+  const h = await healthCheck(cli, dir);
+  if (!h.ok) {
+    const repo = state.repos[repoKey];
+    repo.lastCheck = cur;
+    repo.consecutiveFailures = (repo.consecutiveFailures || 0) + 1;
+    await saveState(state, flags);
+    log(`[!] 通道探活失败（${h.ms}ms）：${(h.errors && h.errors[0]) || '无响应'} → 本轮不派单（不推进 lastHead）`);
+    log(`    处置：确认桌面版 OpenCode 服务正常（可执行 \`opencode service restart\`）后重试；`
+      + `连续失败 ${repo.consecutiveFailures} 次，建议先用 --health 单独排查`);
+    return { ...summary, ok: false, error: 'channel-unhealthy', healthMs: h.ms };
+  }
+  if (h.ms > 30000) log(`  通道探活通过（${h.ms}ms，较慢）`);
+  else log(`  通道探活通过（${h.ms}ms）`);
+
   try {
     const d = await dispatch(cli, dir, plan.newestHash.slice(0, 8), text, flags);
     const repo = state.repos[repoKey];
     repo.lastHead = plan.advanceToHash; // 只推进到本批最旧一条 → 无缺口
+    repo.consecutiveFailures = 0;
     repo.dispatches = [...(repo.dispatches || []), {
       at: cur, kind: 'git', sessionId: d.sessionId, transport: d.transport, conclusion: d.conclusion,
       hashes: plan.take.map((c) => c.hash), advanceTo: plan.advanceToHash, overflow: plan.overflow,
@@ -489,6 +538,16 @@ async function main() {
   log(`mode=${flags.once ? '单次' : `常驻(${flags.interval}s)`}  dryRun=${flags.dryRun}  mockMr=${flags.mockMr ? 'yes' : '-'}  maxCommits=${flags.maxCommits}`);
 
   const release = await acquireLock(flags, repoKey);
+
+  // --health：只探活通道，不派单（排查用）
+  if (flags.healthOnly) {
+    const h = await healthCheck(cli, dir);
+    log(h.ok ? `通道健康 ✅（${h.ms}ms，session=${h.sessionId || '-'}）` : `通道不健康 ❌（${h.ms}ms）：${(h.errors || []).join(' | ')}`);
+    if (flags.json) console.log(JSON.stringify({ health: h.ok, ms: h.ms, errors: h.errors }));
+    await release();
+    process.exit(h.ok ? 0 : 1);
+  }
+
   const ctx = { cli, flags, repoKey, dir };
   let inFlight = false;
   const runOnce = async () => {
