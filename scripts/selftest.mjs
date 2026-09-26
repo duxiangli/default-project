@@ -15,6 +15,7 @@ import {
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict } from './lib/runbook.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
+import { matchPathRules } from './autodispatch-watcher.mjs';
 
 let pass = 0;
 const fails = [];
@@ -341,6 +342,32 @@ console.log('\n[14] 台账医生：检测 + 自动修复 + 幂等（派单后自
   const noAnchor = `# 派单日志\n\n| 派单号 | a | b | c | d | e | f | g | h |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${row('DSP-1')}\n`;
   truthy(analyze(noAnchor, SPEC).issues.some((i) => i.kind === 'no-anchor'), '检出缺锚点');
   eq(analyze('# 空文件\n', SPEC).issues.some((i) => i.kind === 'no-data'), true, '检出无数据行');
+}
+
+console.log('\n[15] 确定性路径匹配（把路由判定移出 LLM，2026-09-27 实测教训）');
+{
+  const CSV = [
+    '路径模式,风险等级,强制加派专家,强制门禁,判定说明',
+    'src/auth/|token,高,expert/09-backend-identity(R);expert/18-security(C),门禁5-安全,认证面',
+    '\\.env|secret,高,expert/18-security(R),门禁5-安全,配置密钥',
+    'migrations?|ddl,高,expert/17-dba(R),门禁7-发布,数据迁移',
+    'readme|\\.md$,低,expert/20-docs(C),门禁7-发布,文档面',
+  ].join('\n');
+
+  const r1 = matchPathRules(['src/auth/login.ts', 'config/.env.example', 'README.md', 'src/app.ts'], CSV);
+  eq(r1.matched.length, 3, '命中 3 条规则');
+  eq(r1.maxLevel, '高', '最高风险等级取命中项最高');
+  truthy(r1.experts.includes('expert/09-backend-identity') && r1.experts.includes('expert/18-security'), '必派专家含身份与安全');
+  truthy(r1.gates.some((g) => g.includes('门禁5')), '门禁提示含门禁5');
+  eq(r1.hitFileCount, 3, '覆盖文件数正确（src/app.ts 不命中）');
+  eq(matchPathRules(['SRC/AUTH/Login.TS'], CSV).matched.length, 1, '路径匹配大小写不敏感');
+  eq(matchPathRules(['docs/expert-team/03-跨域RACI.md'], CSV).matched.length, 1, '中文文件名可参与匹配');
+  eq([matchPathRules(['src/app.ts'], CSV).matched.length, matchPathRules(['src/app.ts'], CSV).maxLevel], [0, null], '无命中返回空且等级 null');
+  eq(matchPathRules([], CSV).matched.length, 0, '空文件列表安全');
+  eq(matchPathRules(['a.ts'], '').matched.length, 0, '空规则表安全');
+
+  const badCsv = '路径模式,风险等级,强制加派专家,强制门禁,判定说明\n([unclosed,高,expert/18-security(R),门禁5,坏正则\nlogin,中,expert/04-web(R),门禁2,正常规则';
+  eq(matchPathRules(['src/login.ts'], badCsv).matched.length, 1, '坏正则被跳过、其余规则仍生效');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fails.length} 失败`);

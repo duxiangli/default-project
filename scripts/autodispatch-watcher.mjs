@@ -59,7 +59,7 @@ const log = (...a) => console.log(`[${now()}]`, ...a);
 export function parseFlags(argv) {
   const f = {
     once: false, dryRun: false, interval: 60, mockMr: null, projectDir: null, statePath: null,
-    maxCommits: 50, resetBaseline: false, replayLast: false, json: false, warnings: [],
+    maxCommits: 8, resetBaseline: false, replayLast: false, json: false, warnings: [],
     transport: 'run', dispatchTimeout: DISPATCH_TIMEOUT_MS, healthOnly: false, resetBreaker: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -126,7 +126,45 @@ export function buildUntrustedBlock(commits, changedFiles) {
   return s;
 }
 
-export const REVIEW_PROMPT = (headline, untrusted) => `${headline}
+/**
+ * 确定性路径匹配：直接用规则表对变更文件做正则匹配，算出「必派专家」。
+ *
+ * 为什么要放在脚本里做（2026-09-27 实测教训）：
+ *   一次 17 提交/53 文件的真实派单里，router 自己通读文件做路径判定，
+ *   烧掉 158K input tokens、50 分钟仍未派任何专家——它在做一件脚本几毫秒就能做完的事。
+ *   把确定性判断移出 LLM，既省 token，也让 router 专注「分诊+汇总」而非「读文件猜路由」。
+ *
+ * 纯函数：可被 selftest 覆盖，CI 无模型可跑。
+ */
+export function matchPathRules(files, rulesCsv) {
+  const lines = String(rulesCsv || '').replace(/^\uFEFF/, '').trim().split(/\r?\n/).slice(1);
+  const rules = lines.map((l) => {
+    const c = l.split(',');
+    return { pattern: c[0] || '', level: c[1] || '', experts: c[2] || '', gate: c[3] || '', note: c[4] || '' };
+  }).filter((r) => r.pattern);
+  const rank = { 高: 3, 中: 2, 低: 1 };
+  const matched = [];
+  const hitFiles = new Set();
+  for (const r of rules) {
+    let re;
+    try { re = new RegExp(r.pattern, 'i'); } catch { continue; } // 规则本身写错就跳过，不让整批失败
+    const filesHit = (files || []).filter((f) => re.test(f));
+    if (!filesHit.length) continue;
+    matched.push({ ...r, files: filesHit.slice(0, 8), fileCount: filesHit.length });
+    for (const f of filesHit) hitFiles.add(f);
+  }
+  const experts = new Set();
+  const gates = new Set();
+  let maxLevel = null;
+  for (const m of matched) {
+    for (const e of m.experts.match(/expert\/[a-z0-9-]+/g) || []) experts.add(e);
+    if (m.gate) gates.add(m.gate);
+    if ((rank[m.level] || 0) > (rank[maxLevel] || 0)) maxLevel = m.level;
+  }
+  return { matched, experts: [...experts], gates: [...gates], maxLevel, hitFileCount: hitFiles.size };
+}
+
+export const REVIEW_PROMPT = (headline, untrusted, pre = null) => `${headline}
 
 ${untrusted}
 
@@ -137,11 +175,13 @@ ${untrusted}
 
 执行要求：
 1. 按《自主介入协议》识别事项、拆分子事项、各配一个人类A；
-2. 路由必须结合变更文件路径判定风险面：认证/权限、支付/资金、数据迁移/ETL、密钥与配置、对外接口、个人信息、基础设施 → 命中即强制加派对应专家为 C 或 R；不确定就多派 1 个 C，禁止漏派高风险域；
+2. **路由已由脚本确定性预判（见下方「路由预判」块）——直接据此派单，不要自己通读文件重新判定**；
+   你最多用 6 次工具调用做「幂等查重 + 必要抽验」，随后**立即开始派单**；
+   通读全部文件既慢又浪费，且该算的规则表脚本已经算完了；
 3. 先查 docs/expert-team/runbook/派单日志.md：若本批 commit 已有评审记录，只补差异，不重复派单；
-4. 按 #派单留痕 追加审计记录（派单号 DSP-YYYYMMDD-HHMM）；需签批项按 #待签批清单 入队（AP 号一一对应，状态只能写「待签批」）；
+4. 按 #派单留痕 追加审计记录（派单号 DSP-YYYYMMDD-HHMM-NN，严格遵守「写入五戒」）；需签批项按 #待签批清单 入队（AP 号尾号与 DSP 一致，状态只能写「待签批」）；
 5. 输出：事项分发摘要 + 专家建议汇总（四态＋严重度）＋ 待人类A签批清单 + 7 道门禁状态；
-6. 边界不变：只出建议，不占A、不代签、不放行；router 与专家的可写文件仍仅「派单日志.md」「待签批清单.md」。`;
+6. 边界不变：只出建议，不占A、不代签、不放行；router 与专家的可写文件仍仅「派单日志.md」「待签批清单.md」。${pre && pre.block ? `\n${pre.block}` : ''}`;
 
 /* ══════════════ 熔断（纯函数状态机，CI 无模型可测） ══════════════ */
 
@@ -561,11 +601,34 @@ async function poll(ctx) {
 
   const plan = planIncremental(commits, flags.maxCommits);
   const files = await getChangedFiles(dir, plan.take.map((c) => c.hash));
+
+  // 确定性路由预判：脚本算好必派专家并注入提示词，避免 router 自己通读几十个文件
+  let pre = null;
+  try {
+    const csv = await readFile(join(ROOT, 'docs', 'expert-team', 'raci', '路径路由规则.csv'), 'utf8');
+    const r = matchPathRules(files, csv);
+    if (r.matched.length) {
+      const items = r.matched.map((m) => `  - 规则[${m.level}] 命中 ${m.fileCount} 个文件 → 必派 ${m.experts}｜门禁 ${m.gate}｜${m.note}`);
+      pre = {
+        block: [
+          '',
+          '## 路由预判（由脚本按 raci/路径路由规则.csv 确定性计算，请直接采用，勿重复推断）',
+          `- 最高风险等级：${r.maxLevel || '低'}　命中规则 ${r.matched.length} 条　覆盖文件 ${r.hitFileCount} 个`,
+          ...items,
+          '',
+          '派单要求：上述「必派」专家一个都不能省；风险等级为「高」时其结论必须含对应门禁判定，缺证据则结论降为「需人工」。',
+        ].join('\n'),
+      };
+      log(`路由预判：命中 ${r.matched.length} 条规则、必派 ${r.experts.length} 个专家、等级 ${r.maxLevel}`);
+    } else {
+      log('路由预判：未命中任何路径规则（按分诊路由表常规处理）');
+    }
+  } catch (e) { log(`[!] 路由预判跳过（读规则表失败: ${e.message}）`); }
   const untrusted = buildUntrustedBlock(plan.take, files);
   const headline = `【事件推送·自主评审】本地仓库检测到新提交 ${plan.take.length} 条`
     + `${plan.overflow ? `（另有 ${plan.overflow} 条将在下轮续派）` : ''}：\n`
     + plan.take.map((c) => `${c.hash.slice(0, 8)} ${sanitizeUntrusted(c.subject)}`).join('\n');
-  const text = REVIEW_PROMPT(headline, untrusted);
+  const text = REVIEW_PROMPT(headline, untrusted, pre);
 
   if (flags.dryRun) {
     log(`dry-run：窗口新提交 ${commits.length} 条，本批将派 ${plan.take.length} 条，溢出 ${plan.overflow} 条`);
