@@ -42,7 +42,9 @@ const ROOT = resolve(__dirname, '..');
 
 export const STATE_VERSION = 2;
 const API_TIMEOUT_MS = Number(process.env.AUTODISPATCH_API_TIMEOUT || 120000);
-const DISPATCH_TIMEOUT_MS = Number(process.env.AUTODISPATCH_DISPATCH_TIMEOUT || 900000); // 一次真实派单含多专家子会话，给足 15 分钟
+// 一次真实派单含多个专家子会话：实测单个冒烟事项约 20 分钟，12 提交/51 文件的批量评审更久。
+// 默认给到 60 分钟；超时只算本轮失败（不推进 lastHead），下轮重试。
+const DISPATCH_TIMEOUT_MS = Number(process.env.AUTODISPATCH_DISPATCH_TIMEOUT || 3600000);
 const MAX_SUBJECT = 120;
 const MAX_PROMPT_CHARS = 4000;
 const MAX_FILES = 200;
@@ -334,7 +336,17 @@ async function dispatch(cli, dir, titleHead, text, flags = {}) {
   }
 
   const args = ['run', '--agent', 'router', '--title', `autodispatch ${titleHead}`, '--format', 'json', text];
-  const r = await exec(cli, args, { cwd: dir, maxBuffer: 32 * 1024 * 1024, timeout });
+  let r;
+  try {
+    r = await exec(cli, args, { cwd: dir, maxBuffer: 32 * 1024 * 1024, timeout });
+  } catch (e) {
+    // 超时要单独识别：它不代表通道坏了，而是评审没跑完——本轮不算失败结论，等下轮重试
+    if (e.killed || e.signal === 'SIGTERM' || /Command failed|ETIMEDOUT|timed out/i.test(e.message || '')) {
+      throw new Error(`派单超时（${Math.round(timeout / 60000)} 分钟未完成，评审可能仍在服务端继续）。`
+        + '处置：--dispatch-timeout <秒> 调大，或用 --max-commits 拆小批次；本轮不推进 lastHead，下轮自动重试。');
+    }
+    throw e;
+  }
   const parsed = parseRunStream((r.stdout || '') + (r.stderr || ''));
   if (parsed.sessionId) log(`  session=${parsed.sessionId}`);
   if (parsed.errors.length) log(`  [!] 运行期报错: ${parsed.errors[0]}`);
