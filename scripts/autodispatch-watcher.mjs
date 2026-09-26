@@ -42,6 +42,7 @@ const ROOT = resolve(__dirname, '..');
 
 export const STATE_VERSION = 2;
 const API_TIMEOUT_MS = Number(process.env.AUTODISPATCH_API_TIMEOUT || 120000);
+const DISPATCH_TIMEOUT_MS = Number(process.env.AUTODISPATCH_DISPATCH_TIMEOUT || 900000); // 一次真实派单含多专家子会话，给足 15 分钟
 const MAX_SUBJECT = 120;
 const MAX_PROMPT_CHARS = 4000;
 const MAX_FILES = 200;
@@ -57,6 +58,7 @@ export function parseFlags(argv) {
   const f = {
     once: false, dryRun: false, interval: 60, mockMr: null, projectDir: null, statePath: null,
     maxCommits: 50, resetBaseline: false, replayLast: false, json: false, warnings: [],
+    transport: 'run', dispatchTimeout: DISPATCH_TIMEOUT_MS,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -76,6 +78,13 @@ export function parseFlags(argv) {
       case '--mock-mr': f.mockMr = String(next() ?? '') || null; break;
       case '--project-dir': f.projectDir = String(next() ?? '') || null; break;
       case '--state': f.statePath = String(next() ?? '') || null; break;
+      case '--transport': {
+        const v = String(next() ?? '');
+        if (v !== 'run' && v !== 'api') f.warnings.push(`--transport 只能是 run|api，收到 ${v}`);
+        else f.transport = v;
+        break;
+      }
+      case '--dispatch-timeout': { const n = Number(next()); if (Number.isFinite(n) && n > 0) f.dispatchTimeout = n * 1000; else f.warnings.push(`--dispatch-timeout 值非法: ${n}`); break; }
       default: f.warnings.push(`未知参数 ${a}`);
     }
   }
@@ -268,21 +277,78 @@ async function getChangedFiles(dir, hashes) {
   return [...new Set(out)];
 }
 
+/** 解析 `opencode run --format json` 的 JSONL 输出流（纯函数，供 selftest 覆盖） */
+export function parseRunStream(text) {
+  const sessionId = null;
+  const texts = [];
+  const errors = [];
+  let sid = sessionId;
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    // 非 JSON 行也要扫错误：额度/鉴权类报错恰恰不是 JSON（2026-09-26 selftest[11] 实测发现会漏）
+    if (!t.startsWith('{')) {
+      if (/free tier|unauthorized|rate.?limit|quota|not allowed|forbidden|\berror\b/i.test(t)) errors.push(t.slice(0, 300));
+      continue;
+    }
+    let ev;
+    try { ev = JSON.parse(t); } catch { continue; }
+    if (ev.sessionID && !sid) sid = ev.sessionID;
+    const p = ev.part || ev;
+    if (ev.type === 'text' || p.type === 'text') {
+      if (p.text) texts.push(String(p.text));
+    } else if (ev.type === 'error' || p.type === 'error' || ev.error) {
+      errors.push(String(p.error || ev.error || JSON.stringify(ev)).slice(0, 300));
+    } else if (/free tier|unauthorized|rate.?limit|quota|not allowed|forbidden/i.test(t)) {
+      errors.push(t.slice(0, 300));
+    }
+  }
+  // 「有会话无结论」判定：有会话 id、但没有任何文本产出 → 模型通道大概率没真正执行
+  const conclusion = texts.some((x) => x.trim().length > 0) && errors.length === 0;
+  return { sessionId: sid, texts, errors, conclusion };
+}
+
 async function api(cli, args) {
   const out = await exec(cli, ['api', 'post', ...args], { maxBuffer: 8 * 1024 * 1024, timeout: API_TIMEOUT_MS });
   const text = (out.stdout || '').trim();
   try { return JSON.parse(text); } catch { return text; }
 }
 
-async function dispatch(cli, dir, titleHead, text) {
-  const ses = await api(cli, ['/api/session', '--data', JSON.stringify({
-    title: `autodispatch ${titleHead}`, agent: 'router', location: { directory: dir },
-  })]);
-  const sid = (ses && (ses.id || (ses.session && ses.session.id) || (ses.data && ses.data.id))) || '';
-  if (!sid) throw new Error(`未取到会话ID: ${JSON.stringify(ses).slice(0, 200)}`);
-  log(`  session=${sid}`);
-  await api(cli, [`/api/session/${sid}/prompt`, '--data', JSON.stringify({ text })]);
-  return sid;
+/**
+ * 派单：默认走 `opencode run`（客户端内执行，模型额度归属正确）。
+ * 旧实现用裸 `api post /api/session` + `/prompt`，在免费额度下会被判为
+ * 「非 OpenCode 客户端」而静默失败（会话建成、tokens=0、无结论）——2026-09-26 实测确认。
+ * 保留 api 传输作为兜底（--transport=api），但它在本机不可用。
+ */
+async function dispatch(cli, dir, titleHead, text, flags = {}) {
+  const timeout = flags.dispatchTimeout || DISPATCH_TIMEOUT_MS;
+  if (flags.transport === 'api') {
+    const ses = await api(cli, ['/api/session', '--data', JSON.stringify({
+      title: `autodispatch ${titleHead}`, agent: 'router', location: { directory: dir },
+    })]);
+    const sid = (ses && (ses.id || (ses.session && ses.session.id) || (ses.data && ses.data.id))) || '';
+    if (!sid) throw new Error(`未取到会话ID: ${JSON.stringify(ses).slice(0, 200)}`);
+    log(`  session=${sid}（transport=api，注意：免费额度下可能无结论）`);
+    await api(cli, [`/api/session/${sid}/prompt`, '--data', JSON.stringify({ text })]);
+    return { sessionId: sid, conclusion: null, transport: 'api', summary: '' };
+  }
+
+  const args = ['run', '--agent', 'router', '--title', `autodispatch ${titleHead}`, '--format', 'json', text];
+  const r = await exec(cli, args, { cwd: dir, maxBuffer: 32 * 1024 * 1024, timeout });
+  const parsed = parseRunStream((r.stdout || '') + (r.stderr || ''));
+  if (parsed.sessionId) log(`  session=${parsed.sessionId}`);
+  if (parsed.errors.length) log(`  [!] 运行期报错: ${parsed.errors[0]}`);
+  if (!parsed.conclusion) {
+    log('  [!] 会话已建但**无结论产出** —— 模型通道可能不可用（台账不会出现新行）。'
+      + ' 处置：确认 provider 可用后用 --replay-last 重放。');
+  }
+  return {
+    sessionId: parsed.sessionId,
+    conclusion: parsed.conclusion,
+    transport: 'run',
+    summary: parsed.texts.join('\n').trim().slice(0, 400),
+    errors: parsed.errors,
+  };
 }
 
 /* ══════════════ 主流程 ══════════════ */
@@ -312,14 +378,17 @@ async function poll(ctx) {
     if (flags.dryRun) { log(`dry-run：将派单 [mock] ${sanitizeUntrusted(flags.mockMr)}`); log('---- 提示词预览 ----\n' + text.slice(0, 600)); return { ...summary, mode: 'mock-dry-run' }; }
     log(`→ 事件 [mock] ${sanitizeUntrusted(flags.mockMr)}`);
     try {
-      const sid = await dispatch(cli, dir, 'smoke', text);
+      const d = await dispatch(cli, dir, 'smoke', text, flags);
       const repo = state.repos[repoKey] || { dispatches: [] };
-      repo.dispatches = [...(repo.dispatches || []), { at: cur, kind: 'mock', subject: sanitizeUntrusted(flags.mockMr), sessionId: sid, hashes: [] }];
+      repo.dispatches = [...(repo.dispatches || []), {
+        at: cur, kind: 'mock', subject: sanitizeUntrusted(flags.mockMr),
+        sessionId: d.sessionId, hashes: [], transport: d.transport, conclusion: d.conclusion,
+      }];
       repo.lastCheck = cur;
       state.repos[repoKey] = repo;
       await saveState(state, flags);
-      log('poll done：派单 1 次');
-      return { ...summary, dispatched: 1, sessionId: sid };
+      log(`poll done：派单 1 次（transport=${d.transport}，结论产出=${d.conclusion}）`);
+      return { ...summary, dispatched: 1, sessionId: d.sessionId, conclusion: d.conclusion };
     } catch (e) { log(`[!] 派单失败: ${e.message}`); return { ...summary, ok: false, error: e.message }; }
   }
 
@@ -339,8 +408,8 @@ async function poll(ctx) {
     log(`→ 重放上一批（${last.at}，session=${last.sessionId || '-'}）`);
     if (flags.dryRun) { log('dry-run：不重放'); return { ...summary, mode: 'replay-dry-run' }; }
     try {
-      const sid = await dispatch(cli, dir, 'replay', REVIEW_PROMPT('【人工复核·重放】请对上一批提交重新评审并补充差异。', buildUntrustedBlock(last.hashes || [], last.files || [])));
-      return { ...summary, dispatched: 1, sessionId: sid, mode: 'replay' };
+      const d = await dispatch(cli, dir, 'replay', REVIEW_PROMPT('【人工复核·重放】请对上一批提交重新评审并补充差异。', buildUntrustedBlock(last.hashes || [], last.files || [])), flags);
+      return { ...summary, dispatched: 1, sessionId: d.sessionId, conclusion: d.conclusion, mode: 'replay' };
     } catch (e) { log(`[!] 重放失败: ${e.message}`); return { ...summary, ok: false, error: e.message }; }
   }
 
@@ -379,18 +448,18 @@ async function poll(ctx) {
 
   log(`→ 事件 新提交 ${plan.take.length} 条（${plan.take.map((c) => c.hash.slice(0, 8)).join(',')}）变更文件 ${files.length} 个`);
   try {
-    const sid = await dispatch(cli, dir, plan.newestHash.slice(0, 8), text);
+    const d = await dispatch(cli, dir, plan.newestHash.slice(0, 8), text, flags);
     const repo = state.repos[repoKey];
     repo.lastHead = plan.advanceToHash; // 只推进到本批最旧一条 → 无缺口
     repo.dispatches = [...(repo.dispatches || []), {
-      at: cur, kind: 'git', sessionId: sid,
+      at: cur, kind: 'git', sessionId: d.sessionId, transport: d.transport, conclusion: d.conclusion,
       hashes: plan.take.map((c) => c.hash), advanceTo: plan.advanceToHash, overflow: plan.overflow,
-      files: files.slice(0, MAX_FILES),
+      files: files.slice(0, MAX_FILES), summary: d.summary || '',
     }];
     repo.lastCheck = cur;
     await saveState(state, flags);
-    log(`poll done：派单 1 次，lastHead→${plan.advanceToHash.slice(0, 8)}${plan.overflow ? `，下轮续派 ${plan.overflow} 条` : ''}`);
-    return { ...summary, dispatched: 1, sessionId: sid, overflow: plan.overflow, hashes: plan.take.map((c) => c.hash) };
+    log(`poll done：派单 1 次（transport=${d.transport}，结论产出=${d.conclusion}），lastHead→${plan.advanceToHash.slice(0, 8)}${plan.overflow ? `，下轮续派 ${plan.overflow} 条` : ''}`);
+    return { ...summary, dispatched: 1, sessionId: d.sessionId, conclusion: d.conclusion, overflow: plan.overflow, hashes: plan.take.map((c) => c.hash) };
   } catch (e) {
     log(`[!] 派单失败: ${e.message}（不推进 lastHead，下次轮询重试）`);
     return { ...summary, ok: false, error: e.message };

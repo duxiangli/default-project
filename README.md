@@ -88,7 +88,10 @@
 
 - **会话内自主**：本项目新会话默认由 `router` 接管（`.opencode/opencode.jsonc` 的 `default_agent: router`），任何输入只要可识别为工作事项就自动分诊派单，并汇总「事项分发＋专家建议＋待人类A签批清单」。想绕开就在单个会话切回 `build`。
 - **审计留痕 + 审批闭环**：router 是全体系**唯一**拿到写白名单的 Agent，且仅两个文件——`runbook/派单日志.md`（每次派单留痕，含派单号 `DSP-...`）与 `runbook/待签批清单.md`（需签批项自动入队，只能写「待签批」）；`runbook/审批记录.md` 为人类签批台账，Agent 无权写入（校验脚本第 10/11 节强制）。
-- **事件驱动（可选·本地零凭据）**：`node scripts/autodispatch-watcher.mjs --once --dry-run`（首次运行自动建立基线，只报告不派单）→ 之后 `--once` 跑一轮或 `--interval 60` 常驻。仓库出现**新提交** → 自动创建 router 会话发起自主评审。想不依赖真实提交验证全链路：`--mock-mr=冒烟标题`。需要：本机 OpenCode 服务运行中、模型配置支持子 Agent。
+- **事件驱动（可选·本地零凭据）**：`node scripts/autodispatch-watcher.mjs --once --dry-run`（首次运行自动建立基线，只报告不派单**且不写盘**）→ 之后 `--once` 跑一轮或 `--interval 60` 常驻。仓库出现**新提交** → 自动派单评审（单实例锁防重复；in-flight 互斥防叠加）。想不依赖真实提交验证全链路：`--mock-mr=冒烟标题`。
+  - **传输层默认 `--transport=run`**（`opencode run --agent router`）：这是唯一能正确走模型额度的路径。旧的裸 `api post /api/session` 在免费额度下会**静默建成会话但零产出**（tokens=0、无结论、不报错），已不作为默认。详见 `04-编排与门禁.md` §4.2.1。
+  - **判断派单是否真的生效，看台账（`派单日志.md` 是否新增行），不要只看 watcher 自己的日志**——watcher 会显式打印 `结论产出=true/false`。
+  - 一次真实派单串多个专家子会话，**耗时可达 10~20 分钟**；`--dispatch-timeout` 默认 900s。通道异常时 `--replay-last --once` 重放。
 - **边界不放松**：router 与 20 个专家仍**不占 A、不代签、不放行**；结论一律四态建议，生产/个保/等保/安全高危待人类首席签批，7 道门禁照常校验。
 
 > 路由 Agent 与专家 Agent 的详细说明见 `.opencode/agents/` 下各文件头注释与正文「权威口径」段。

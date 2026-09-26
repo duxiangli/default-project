@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import {
   parseFlags, sanitizeUntrusted, buildUntrustedBlock, planIncremental,
-  REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, STATE_VERSION,
+  REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream, STATE_VERSION,
 } from './autodispatch-watcher.mjs';
 
 let pass = 0;
@@ -191,6 +191,38 @@ console.log('\n[10] 回归：dry-run 不写盘（只报告、不改任何状态�
   await loadState({ statePath: p }, { persist: true });
   const after = JSON.parse(await readFile(p, 'utf8'));
   truthy(!!after.repos, '非 dry-run 才会落盘迁移');
+}
+
+console.log('\n[11] `opencode run` JSONL 解析 + 「有会话无结论」识别（1222 模型通道）');
+{
+  const good = [
+    JSON.stringify({ type: 'step_start', sessionID: 'ses_abc', part: { id: 'p1', type: 'step-start' } }),
+    JSON.stringify({ type: 'text', sessionID: 'ses_abc', part: { type: 'text', text: 'ROUTER_OK' } }),
+  ].join('\n');
+  const g = parseRunStream(good);
+  eq(g.sessionId, 'ses_abc', '解析出会话 ID');
+  eq(g.texts, ['ROUTER_OK'], '解析出文本结论');
+  eq(g.conclusion, true, '有文本产出 → 判定结论已产出');
+
+  const silent = JSON.stringify({ type: 'step_start', sessionID: 'ses_silent', part: { type: 'step-start' } });
+  const s = parseRunStream(silent);
+  eq(s.sessionId, 'ses_silent', '静默会话仍能取到 ID');
+  eq(s.conclusion, false, '有会话但无文本 → 判定「无结论」（1222 原始故障形态）');
+
+  const denied = [
+    JSON.stringify({ type: 'step_start', sessionID: 'ses_x', part: {} }),
+    'Error: OpenCode\'s free tier can only be used from within OpenCode',
+  ].join('\n');
+  const d = parseRunStream(denied);
+  eq(d.conclusion, false, '额度报错 → 判定无结论');
+  truthy(d.errors.length > 0 && /free tier/.test(d.errors[0]), '捕获额度类报错原文');
+
+  eq(parseRunStream('').conclusion, false, '空输出安全');
+  eq(parseRunStream('not json\n{"broken":').texts.length, 0, '非 JSON 行被跳过不崩');
+  eq(parseFlags(['--transport=api']).transport, 'api', '--transport 参数解析');
+  eq(parseFlags(['--transport=run']).transport, 'run', '--transport 默认 run');
+  truthy(parseFlags(['--transport=bogus']).warnings.length === 1, '非法 transport 进告警');
+  eq(parseFlags(['--dispatch-timeout', '30']).dispatchTimeout, 30000, '派单超时参数换算为毫秒');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fails.length} 失败`);
