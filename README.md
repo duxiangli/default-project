@@ -108,7 +108,7 @@
 | --- | --- | --- |
 | `raci/门禁阈值.csv` + `06-门禁阈值与判定口径.md` | 7 道门禁的**可判定阈值**（CVSS≥7.0、逃逸率≤2%、P99 劣化≤20%、演练≤90 天…）、A 归属、证据要求、自动化程度 | — |
 | `raci/路径路由规则.csv` | **确定性路由**：变更路径命中即强制加派专家（认证/支付/迁移/密钥/CI/个保…15 条规则） | — |
-| `scripts/selftest.mjs` | watcher 纯函数与状态机自测（参数解析、注入清洗、增量分批、fail-closed、单实例锁） | `node scripts/selftest.mjs` |
+| `scripts/selftest.mjs` | watcher 纯函数与状态机自测（参数解析、注入清洗、增量分批、fail-closed、单实例锁、路径转义回归、dry-run 不写盘回归） | `node scripts/selftest.mjs` |
 | `scripts/approval-sync.mjs` | 签批闭环同步：生成 `runbook/签批状态视图.md`（积压/账龄/超期/孤儿签批） | `node scripts/approval-sync.mjs` `--check` `--strict` |
 | `scripts/dispatch-metrics.mjs` | 度量看板：四态分布/严重度/采纳率/闭环时长/数据质量，算不出的显式标注 | `node scripts/dispatch-metrics.mjs` `--check` |
 | `scripts/guard-audit.mjs` | 治理契约审计：写白名单精确性、专家只读、无明文密钥、单号三方一致、加固防回退 | `node scripts/guard-audit.mjs --strict` |

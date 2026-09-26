@@ -148,7 +148,7 @@ export function statePathOf(flags) {
     || join(process.env.APPDATA || homedir(), 'ai.opencode.desktop', 'autodispatch-state.json');
 }
 
-export async function loadState(flags, { failClosed = true } = {}) {
+export async function loadState(flags, { failClosed = true, persist = true } = {}) {
   const p = statePathOf(flags);
   let raw;
   try { raw = await readFile(p, 'utf8'); }
@@ -168,8 +168,9 @@ export async function loadState(flags, { failClosed = true } = {}) {
       if (v && typeof v === 'object' && !k.startsWith('_')) repos[k] = { dispatches: [], ...v };
     }
     data = { version: STATE_VERSION, repos };
-    await saveState(data, flags);
-    log('state: 已将 v1 结构迁移为 v2（repos 包装 + dispatches 审计）');
+    // dry-run 语义：只报告、不写盘（2026-09-26 留档实测发现 dry-run 会写状态迁移）
+    if (persist) { await saveState(data, flags); log('state: 已将 v1 结构迁移为 v2（repos 包装 + dispatches 审计）'); }
+    else log('state: 检测到 v1 结构（dry-run 不写盘，未迁移）');
   }
   data.path = p;
   return data;
@@ -231,8 +232,10 @@ export async function findCli() {
   return 'opencode-cli';
 }
 
-async function git(dir, args) {
-  const out = await exec('git', ['-C', dir, ...args], { maxBuffer: 8 * 1024 * 1024, timeout: 60000 });
+export async function git(dir, args) {
+  // core.quotepath=false：否则非 ASCII 路径会被 git 转义成 "docs/\345\256\241..." 的八进制串，
+  // 导致下游「路径路由规则」正则匹配全部失败（2026-09-26 留档实测发现）。
+  const out = await exec('git', ['-C', dir, '-c', 'core.quotepath=false', ...args], { maxBuffer: 8 * 1024 * 1024, timeout: 60000 });
   return (out.stdout || '').replace(/\r?\n$/, '');
 }
 const isGitRepo = async (dir) => { try { return (await git(dir, ['rev-parse', '--is-inside-work-tree'])).trim() === 'true'; } catch { return false; } };
@@ -289,7 +292,7 @@ async function poll(ctx) {
 
   if (!(await isGitRepo(dir))) { log(`[!] ${dir} 不是 git 仓库，跳过`); return summary; }
 
-  const state = await loadState(flags);
+  const state = await loadState(flags, { persist: !flags.dryRun });
   const cur = new Date().toISOString();
   const prev = state.repos[repoKey];
 

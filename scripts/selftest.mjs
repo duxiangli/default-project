@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import {
   parseFlags, sanitizeUntrusted, buildUntrustedBlock, planIncremental,
-  REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, STATE_VERSION,
+  REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, STATE_VERSION,
 } from './autodispatch-watcher.mjs';
 
 let pass = 0;
@@ -152,6 +152,38 @@ console.log('\n[8] 单实例锁（并发重复派单防护）');
   await throws(() => stat(lockPath), /ENOENT/, '释放锁后锁文件消失');
   await rel1();
   await rel1();
+}
+
+console.log('\n[9] 回归：git 路径不做八进制转义（否则路径路由规则全部失配）');
+{
+  const dir = process.cwd();
+  let names = null;
+  try { names = await git(dir, ['show', '--name-only', '--pretty=format:', 'HEAD']); } catch { /* 非 git 环境跳过 */ }
+  if (names === null) {
+    console.log('  ⏭  非 git 环境或无 HEAD，跳过');
+  } else {
+    const hasOctal = /\\[0-3][0-7]{2}/.test(names);
+    truthy(!hasOctal, '输出不含八进制转义序列（core.quotepath=false 生效）');
+    // 仓库里有中文名文件时，断言其以真实字符出现
+    if (/[\u4e00-\u9fa5]/.test(names) || /审批记录|派单日志|待签批清单/.test(names)) {
+      truthy(/审批记录|派单日志|待签批清单/.test(names), '中文文件名以真实字符返回（可被路径路由规则匹配）');
+    } else {
+      ok('本次 HEAD 未触及中文名文件，跳过中文断言');
+    }
+  }
+}
+
+console.log('\n[10] 回归：dry-run 不写盘（只报告、不改任何状态）');
+{
+  const p = join(tmp, 'dryrun-state.json');
+  const v1 = JSON.stringify({ 'C:/repo': { seenHashes: ['x'], lastHead: 'x', lastCheck: 't' } });
+  await writeFile(p, v1, 'utf8');
+  const s = await loadState({ statePath: p }, { persist: false });
+  truthy(!!s.repos['C:/repo'], 'dry-run 仍在内存中完成 v1→v2 迁移');
+  eq((await readFile(p, 'utf8')).trim(), v1, 'dry-run 未把迁移结果写回文件');
+  await loadState({ statePath: p }, { persist: true });
+  const after = JSON.parse(await readFile(p, 'utf8'));
+  truthy(!!after.repos, '非 dry-run 才会落盘迁移');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fails.length} 失败`);
