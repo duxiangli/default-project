@@ -4,7 +4,7 @@
  * 覆盖 watcher v2 的纯函数与状态机不变量——对应 DSP-20260925-1221 提出的
  * 「无测试证据、不可常驻启用」意见。这些断言可在 CI 无模型环境运行。
  */
-import { mkdtemp, readFile, writeFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -24,7 +24,11 @@ const throws = async (fn, re, msg) => {
   try { await fn(); bad(`${msg}（未抛错）`); } catch (e) { re.test(e.message) ? ok(msg) : bad(`${msg}（错误信息不符: ${e.message}）`); }
 };
 
-const tmp = await mkdtemp(join(tmpdir(), 'opencode', 'autodispatch-selftest-'));
+// mkdtemp 要求父目录已存在；CI runner（ubuntu）上没有 <tmp>/opencode，需先建，
+// 否则 GitHub Actions 首跑即 ENOENT 失败（2026-09-26 1223 条件执行时预判并修复）
+const TMPROOT = join(tmpdir(), 'opencode');
+await mkdir(TMPROOT, { recursive: true });
+const tmp = await mkdtemp(join(TMPROOT, 'autodispatch-selftest-'));
 
 console.log('\n[1] 参数解析（--flag=value 与 --flag value 等价）');
 {

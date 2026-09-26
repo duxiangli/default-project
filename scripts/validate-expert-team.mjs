@@ -3,7 +3,10 @@
  * 用法：node scripts/validate-expert-team.mjs
  * 校验：Agent 文件完整性/frontmatter/路由引用/岗位卡命名/RACI 双写一致/占位符规范
  */
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile as rawReadFile } from 'node:fs/promises';
+
+/** 统一归一化换行：CRLF 检出（Windows）下校验结果必须与 LF 检出（Linux CI）一致 */
+const rd = async (p, enc = 'utf8') => (await rawReadFile(p, enc)).replace(/\r\n/g, '\n');
 import path from 'node:path';
 
 let pass = 0;
@@ -25,7 +28,7 @@ else bad(`专家 Agent 数量应为 20，实际 ${expertFiles.length}`);
 const expertIds = [];
 for (const f of expertFiles) {
   const p = path.join(expertDir, f);
-  const c = await readFile(p, 'utf8');
+  const c = await rd(p, 'utf8');
   const m = f.match(/^(\d{2})-/);
   const issues = [];
   if (!c.startsWith('---\n')) issues.push('缺 frontmatter 起始 ---');
@@ -47,7 +50,7 @@ if (JSON.stringify(expertIds) === JSON.stringify(expectIds)) ok('专家 Agent �
 else bad(`编号不齐: ${expertIds.join(',')}`);
 
 // ── 3. 路由引用 ↔ 实际文件 ──
-const routerText = await readFile(path.join(agentsDir, 'router.md'), 'utf8');
+const routerText = await rd(path.join(agentsDir, 'router.md'), 'utf8');
 if (/^mode: primary$/m.test(routerText)) ok('router mode=primary');
 else bad('router 应为 primary');
 const fileIds = new Set(expertFiles.map((f) => f.replace(/\.md$/, '')));
@@ -68,7 +71,7 @@ if (cardFiles.length === 21) ok(`岗位卡共 ${cardFiles.length} 张（00-路�
 else bad(`岗位卡数量应为 21，实际 ${cardFiles.length}`);
 const cardIdSet = new Set();
 for (const f of cardFiles) {
-  const c = await readFile(path.join(cardsDir, f), 'utf8');
+  const c = await rd(path.join(cardsDir, f), 'utf8');
   const m = c.match(/命名：`(expert\/[\d]{2}-[a-z-]+)`/);
   if (m) cardIdSet.add(m[1]);
   else if (!f.startsWith('00-')) bad(`${f}: 缺命名字段`);
@@ -81,7 +84,7 @@ if (alg(cardIdSet) === alg(await (async () => {
 else bad('岗位卡命名与专家 Agent 文件名不一致');
 
 // ── 5. RACI CSV 结构 ──
-const csv = await readFile('docs/expert-team/raci/RACI矩阵.csv', 'utf8');
+const csv = await rd('docs/expert-team/raci/RACI矩阵.csv', 'utf8');
 const lines = csv.replace(/^\uFEFF/, '').trim().split(/\r?\n/);
 if (lines.length === 16) ok(`RACI CSV 1 表头 + 15 事项`);
 else bad(`RACI CSV 行数应为 16，实际 ${lines.length}`);
@@ -94,7 +97,7 @@ const csvTodo = new Set(csvRows.map((c) => c[0]));
 const csvByTodo = new Map(csvRows.map((c) => [c[0], c]));
 
 // ── 6. 03-跨域RACI.md 与 CSV 逐格一致（事项名 + A/R/C/I 四列值）──
-const raciDoc = await readFile(path.join(docDir, '03-跨域RACI.md'), 'utf8');
+const raciDoc = await rd(path.join(docDir, '03-跨域RACI.md'), 'utf8');
 const raciLines = raciDoc.split('\n');
 const headerIdx = raciLines.findIndex((l) => l.startsWith('| 事项 |') || l.startsWith('| 事项|'));
 if (headerIdx === -1) bad('03-跨域RACI.md 未找到 RACI 分配表');
@@ -127,8 +130,8 @@ if (cellDiff.length === 0) ok('03-跨域RACI.md 与 CSV 的 A/R/C/I 四列逐格
 else bad(`RACI 值漂移 ${cellDiff.length} 处: ${cellDiff.slice(0, 3).join('; ')}${cellDiff.length > 3 ? ' …' : ''}`);
 
 // ── 6b. 路由表不得再复制 C 名单（C 唯一事实源 = CSV）──
-const routerCard = await readFile(path.join(cardsDir, '00-路由Agent.md'), 'utf8');
-const orchestrate = await readFile(path.join(docDir, '04-编排与门禁.md'), 'utf8');
+const routerCard = await rd(path.join(cardsDir, '00-路由Agent.md'), 'utf8');
+const orchestrate = await rd(path.join(docDir, '04-编排与门禁.md'), 'utf8');
 const routeDrift = [];
 if (/\| 事项 \| R \| C \|/.test(routerCard) || /主派 R \/ 咨询 C/.test(routerCard)) routeDrift.push('00-路由Agent卡 仍维护 C 列');
 if (/\| 输入类型 \| 主派 \| 咨询（C） \|/.test(orchestrate)) routeDrift.push('04-编排与门禁 仍维护 C 列');
@@ -140,13 +143,13 @@ else bad(`路由表 C 名单漂移风险: ${routeDrift.join('; ')}`);
 // ── 7. 占位符规范：OpenCode 内不得有 {公司}，docs 模板允许 ──
 let stray = 0;
 for (const f of [...routerText && [], ...expertFiles.map((f) => `expert/${f}`)]) {
-  const c = f === 'router.md' ? routerText : await readFile(path.join(agentsDir, f), 'utf8');
+  const c = f === 'router.md' ? routerText : await rd(path.join(agentsDir, f), 'utf8');
   if (c.includes('{公司}')) { stray++; bad(`${f}: 残留 {公司}`); }
 }
 if (!stray) ok('OpenCode Agent 无 {公司} 字面量');
 
 // ── 8. 首席名册一致性（单一事实源） ──
-const rosterCsv = await readFile('docs/expert-team/roster/首席名册.csv', 'utf8');
+const rosterCsv = await rd('docs/expert-team/roster/首席名册.csv', 'utf8');
 const rosterRows = rosterCsv
   .replace(/^\uFEFF/, '')
   .trim()
@@ -160,20 +163,20 @@ if (emptyFields.length === 0) ok('名册字段（职位/姓名/工号/日期/签
 else bad(`名册存在空字段: ${emptyFields.map((r) => r[0]).join(',')}`);
 const rosterMap = new Map(rosterRows.map((r) => [Number(r[0]), { role: r[2], name: r[3] }]));
 
-const overviewText = await readFile('docs/expert-team/00-体系总览.md', 'utf8');
+const overviewText = await rd('docs/expert-team/00-体系总览.md', 'utf8');
 const rosterMiss = [];
 for (let i = 1; i <= 20; i++) {
   const r = rosterMap.get(i);
   if (!r) { rosterMiss.push(`缺${i}`); continue; }
   const cardFile = (await readdir(cardsDir)).find((f) => f.startsWith(String(i).padStart(2, '0') + '-'));
-  const card = await readFile(path.join(cardsDir, cardFile), 'utf8');
-  const agent = await readFile(path.join(expertDir, expertFiles.find((f) => f.startsWith(String(i).padStart(2, '0') + '-'))), 'utf8');
+  const card = await rd(path.join(cardsDir, cardFile), 'utf8');
+  const agent = await rd(path.join(expertDir, expertFiles.find((f) => f.startsWith(String(i).padStart(2, '0') + '-'))), 'utf8');
   if (!card.includes(`${r.role} · ${r.name}`)) rosterMiss.push(`卡${i}缺姓名`);
   if (!agent.includes(`人类首席（${r.role} · ${r.name}）`)) rosterMiss.push(`Agent${i}缺姓名`);
   if (!routerText.includes(`${r.role} · ${r.name}`)) rosterMiss.push(`router缺${r.name}`);
   if (!overviewText.includes(`${r.role} · ${r.name}`)) rosterMiss.push(`00总览缺${r.name}`);
 }
-const readme = await readFile('README.md', 'utf8');
+const readme = await rd('README.md', 'utf8');
 for (const r of rosterRows) {
   if (!readme.includes(`${r[2]} · ${r[3]}`)) rosterMiss.push(`README缺${r[3]}`);
 }
@@ -181,7 +184,7 @@ if (rosterMiss.length === 0) ok('名册 ↔ 岗位卡 ↔ 专家Agent ↔ router
 else bad(`名册传播不完整: ${rosterMiss.join('; ')}`);
 
 // ── 9. MCP 接入样例：opencode.jsonc ↔ Agent 只读权限 ──
-const mcpConfig = await readFile('.opencode/opencode.jsonc', 'utf8');
+const mcpConfig = await rd('.opencode/opencode.jsonc', 'utf8');
 const mcpIssues = [];
 for (const token of ['"mcp"', '"servers"', '"gitlab"', '"jira"', '{env:GITLAB_PERSONAL_ACCESS_TOKEN}', '{env:JIRA_API_TOKEN}']) {
   if (!mcpConfig.includes(token)) mcpIssues.push(`缺 ${token}`);
@@ -197,7 +200,7 @@ else bad(`MCP 配置问题: ${mcpIssues.join('; ')}`);
 const jiraSet = new Set(['router', '01', '02', '14', '16', '18', '19', '20']);
 const mcpMiss = [];
 for (const f of [...expertFiles.map((x) => `expert/${x}`), 'router.md']) {
-  const c = f === 'router.md' ? routerText : await readFile(path.join(agentsDir, f), 'utf8');
+  const c = f === 'router.md' ? routerText : await rd(path.join(agentsDir, f), 'utf8');
   const num = f === 'router.md' ? 'router' : f.slice(7, 9);
   for (const t of ['gitlab_get_*', 'gitlab_list_*', 'gitlab_search_*']) {
     if (!c.includes(t)) mcpMiss.push(`${f} 缺 ${t}`);
@@ -224,20 +227,20 @@ if (!routerText.includes('docs/expert-team/runbook/审批记录.md')) autoIssues
 if (!routerText.includes('# 自主介入协议')) autoIssues.push('router 缺自主介入协议');
 if (!routerText.includes('# 派单留痕')) autoIssues.push('router 缺派单留痕');
 let dispatchLogText = '';
-try { dispatchLogText = await readFile('docs/expert-team/runbook/派单日志.md', 'utf8'); } catch { autoIssues.push('缺 派单日志.md'); }
+try { dispatchLogText = await rd('docs/expert-team/runbook/派单日志.md', 'utf8'); } catch { autoIssues.push('缺 派单日志.md'); }
 if (dispatchLogText && !dispatchLogText.includes('<!-- dispatch-log-end -->')) autoIssues.push('派单日志缺末尾标记');
-try { await readFile('scripts/autodispatch-watcher.mjs', 'utf8'); } catch { autoIssues.push('缺 scripts/autodispatch-watcher.mjs'); }
+try { await rd('scripts/autodispatch-watcher.mjs', 'utf8'); } catch { autoIssues.push('缺 scripts/autodispatch-watcher.mjs'); }
 if (autoIssues.length === 0) ok('自主派单：default_agent=router + 双写白名单(派单日志/待签批清单) + 事件驱动脚本就绪');
 else bad(`自主派单配置不齐: ${autoIssues.join('; ')}`);
 
 // ── 11. 审批闭环：待签批清单(router可写队列) / 审批记录(人工台账+模板) / 派单日志单号 ──
 const approvalIssues = [];
 let pendingText = '';
-try { pendingText = await readFile('docs/expert-team/runbook/待签批清单.md', 'utf8'); } catch { approvalIssues.push('缺 待签批清单.md'); }
+try { pendingText = await rd('docs/expert-team/runbook/待签批清单.md', 'utf8'); } catch { approvalIssues.push('缺 待签批清单.md'); }
 if (pendingText && !pendingText.includes('<!-- pending-approval-end -->')) approvalIssues.push('待签批清单缺末尾标记');
 if (pendingText && !/审批单号/.test(pendingText)) approvalIssues.push('待签批清单缺审批单号列');
 let approvalLogText = '';
-try { approvalLogText = await readFile('docs/expert-team/runbook/审批记录.md', 'utf8'); } catch { approvalIssues.push('缺 审批记录.md'); }
+try { approvalLogText = await rd('docs/expert-team/runbook/审批记录.md', 'utf8'); } catch { approvalIssues.push('缺 审批记录.md'); }
 if (approvalLogText && !/(审批单模板|签批结论四态)/.test(approvalLogText)) approvalIssues.push('审批记录缺模板/四态定义');
 if (dispatchLogText && !/派单号/.test(dispatchLogText)) approvalIssues.push('派单日志缺派单号列');
 if (approvalIssues.length === 0) ok('审批闭环：派单日志(派单号) → 待签批清单(router可写队列) → 审批记录(人类台账+审批单模板) 就绪');
@@ -246,7 +249,7 @@ else bad(`审批闭环不齐: ${approvalIssues.join('; ')}`);
 // ── 12. 门禁阈值可判定性（7 道门禁各有唯一人类 A + 阈值 + 证据）──
 const gateIssues = [];
 let gateCsv = '';
-try { gateCsv = (await readFile(path.join(docDir, 'raci', '门禁阈值.csv'), 'utf8')).replace(/^\uFEFF/, ''); }
+try { gateCsv = (await rd(path.join(docDir, 'raci', '门禁阈值.csv'), 'utf8')).replace(/^\uFEFF/, ''); }
 catch { gateIssues.push('缺 raci/门禁阈值.csv'); }
 const gateRows = gateCsv.trim() ? gateCsv.trim().split(/\r?\n/).slice(1).map((l) => l.split(',')) : [];
 if (gateRows.length !== 7) gateIssues.push(`门禁阈值应为 7 行，实际 ${gateRows.length}`);
@@ -268,7 +271,7 @@ if (new Set(gateAs.values()).size !== 7) gateIssues.push('门禁 A 存在重复�
 const gateClaim = { 1: '01-产品专家.md', 2: '13-架构治理.md', 3: '14-QA测试治理.md', 4: '15-QA性能可靠.md', 5: '18-安全专家.md', 6: '19-合规个保.md', 7: '16-DevOps-SRE.md' };
 for (const [no, file] of Object.entries(gateClaim)) {
   try {
-    const c = await readFile(path.join(cardsDir, file), 'utf8');
+    const c = await rd(path.join(cardsDir, file), 'utf8');
     const tail = (c.split('\n').find((l) => l.startsWith('> RACI')) || '');
     if (!new RegExp(`第\\s*${no}\\s*道|认领门禁[^。]*${no}`).test(tail)) gateIssues.push(`门禁${no} 在 ${file} 无认领声明`);
   } catch { gateIssues.push(`门禁${no} 认领卡缺失: ${file}`); }
@@ -293,7 +296,7 @@ const scanTargets = [
   'runbook/审批记录.md', 'runbook/派单日志.md', 'runbook/待签批清单.md',
 ];
 for (const rel of scanTargets) {
-  const t = await readFile(path.join(docDir, rel), 'utf8');
+  const t = await rd(path.join(docDir, rel), 'utf8');
   for (const [re, label] of forbiddenTerms) if (re.test(t)) termIssues.push(`${rel}: ${label}`);
 }
 if (termIssues.length === 0) ok('术语规范：无「治理委/治理委员会」变体、无低-中/低-高/高危档位');
@@ -303,7 +306,7 @@ else bad(`术语漂移 ${termIssues.length} 处: ${[...new Set(termIssues)].slic
 const cardIssues = [];
 for (const f of cardFiles) {
   if (f.startsWith('00-')) continue; // 路由卡结构不同，已单独校验
-  const c = await readFile(path.join(cardsDir, f), 'utf8');
+  const c = await rd(path.join(cardsDir, f), 'utf8');
   const miss = [];
   if (!c.includes('<!--结论')) miss.push('缺结论块契约');
   if (!c.includes('## 权威口径')) miss.push('缺权威口径段');
@@ -321,7 +324,7 @@ const bogusRoles = [[/(?<!前端)财务合规/, '财务合规'], [/(?<!iOS)(?<!A
   [/(?<!前端)Web首席/, 'Web首席'], [/(?<!前端)性能安全首席/, '性能安全首席'], [/UIUX人类首席/, 'UIUX人类首席']];
 const roleIssues = [];
 for (const f of cardFiles) {
-  const c = await readFile(path.join(cardsDir, f), 'utf8');
+  const c = await rd(path.join(cardsDir, f), 'utf8');
   for (const [re, label] of bogusRoles) if (re.test(c)) roleIssues.push(`${f}: 「${label}」不在名册`);
 }
 if (roleIssues.length === 0) ok(`升级对象命名：20 张卡无「名册外角色」（名册 ${rosterRoles.size} 个职位）`);
@@ -337,18 +340,18 @@ const autoAssets = [
 ];
 const assetIssues = [];
 for (const [f, re, label] of autoAssets) {
-  try { const t = await readFile(f, 'utf8'); if (!re.test(t)) assetIssues.push(`${label}(${f}) 内容异常`); }
+  try { const t = await rd(f, 'utf8'); if (!re.test(t)) assetIssues.push(`${label}(${f}) 内容异常`); }
   catch { assetIssues.push(`缺 ${label}(${f})`); }
 }
 // watcher 加固标记（防回退）
 try {
-  const w = await readFile('scripts/autodispatch-watcher.mjs', 'utf8');
+  const w = await rd('scripts/autodispatch-watcher.mjs', 'utf8');
   for (const [label, re] of [['fail-closed', /fail-closed/], ['注入隔离', /UNTRUSTED_COMMIT_DATA/], ['单实例锁', /acquireLock/], ['增量取提交', /\.\.HEAD/], ['原子写', /rename\(tmp/]])
     if (!re.test(w)) assetIssues.push(`watcher 缺加固标记：${label}`);
 } catch { assetIssues.push('缺 scripts/autodispatch-watcher.mjs'); }
 // 生成视图与锚点
-try { const t = await readFile(path.join(docDir, 'runbook', '签批状态视图.md'), 'utf8'); if (!t.includes('未闭环')) assetIssues.push('签批状态视图内容异常'); } catch { assetIssues.push('缺 签批状态视图.md（跑 approval-sync.mjs）'); }
-try { const t = await readFile(path.join(docDir, 'runbook', '度量看板.md'), 'utf8'); if (!t.includes('派单总量')) assetIssues.push('度量看板内容异常'); } catch { assetIssues.push('缺 度量看板.md（跑 dispatch-metrics.mjs）'); }
+try { const t = await rd(path.join(docDir, 'runbook', '签批状态视图.md'), 'utf8'); if (!t.includes('未闭环')) assetIssues.push('签批状态视图内容异常'); } catch { assetIssues.push('缺 签批状态视图.md（跑 approval-sync.mjs）'); }
+try { const t = await rd(path.join(docDir, 'runbook', '度量看板.md'), 'utf8'); if (!t.includes('派单总量')) assetIssues.push('度量看板内容异常'); } catch { assetIssues.push('缺 度量看板.md（跑 dispatch-metrics.mjs）'); }
 if (pendingText && !/DSP-YYYYMMDD-HHMM-NN|AP-YYYYMMDD-HHMM-NN/.test(pendingText)) assetIssues.push('待签批清单未声明带序号位的单号规则');
 if (approvalLogText && !/approval-ledger-begin/.test(approvalLogText)) assetIssues.push('审批记录缺台账解析锚点');
 if (assetIssues.length === 0) ok(`自动化资产：${autoAssets.length} 个脚本就绪 + watcher 加固在位 + 视图/锚点齐备`);
