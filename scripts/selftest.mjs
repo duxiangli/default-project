@@ -139,7 +139,10 @@ console.log('\n[8] 单实例锁（并发重复派单防护）');
   let detectedAlive = true;
   try { process.kill(live.pid, 0); } catch { detectedAlive = false; }
   truthy(detectedAlive, 'process.kill(pid,0) 在本机可正确识别存活进程');
+  // 必须等子进程真正退出：Linux 下 kill 后进入 zombie，pid 仍"存在"，
+  // 会让后续 acquireLock 误判为活锁（2026-09-26 首次真实 CI run 36243203683 失败根因）
   live.kill();
+  await new Promise((r) => live.on('exit', r));
 
   // 同 pid 重入允许（同一进程内幂等）
   const rel1 = await acquireLock({ statePath: p }, 'C:/repo');
