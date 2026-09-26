@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 跨平台配置包 | `跨平台配置包/docs/expert-team/` | 21 张卡（00-路由Agent + 20 岗位卡）、主文档 00~05、RACI 矩阵 CSV、首席名册、审计/审批台账。导入 **Dify / Coze / LangGraph / AutoGen / GitLab Duo / 自研平台** |
 | OpenCode Agent 版 | `OpenCode-Agent版/.opencode/` | 1 个路由 Agent（primary，自主派单留痕）+ 20 个专家子 Agent（subagent，只读）+ `opencode.jsonc`（`default_agent=router`，MCP gitlab/jira 默认 disabled 样例） |
-| 运维脚本 | `scripts/` | `validate-expert-team.mjs`（38 项一致性校验）、`sync-roster.mjs`（名册 → 岗位卡/Agent/路由表同步）、`autodispatch-watcher.mjs`（本地 git 新提交 → 自主派单监听，零凭据） |
+| 运维脚本 | `scripts/` | `validate-expert-team.mjs`（体系一致性 14 节校验）、`sync-roster.mjs`（名册 → 岗位卡/Agent/路由表同步）、`autodispatch-watcher.mjs`（本地 git 新提交 → 自主派单监听，零凭据）、`approval-sync.mjs` + `dispatch-metrics.mjs` + `guard-audit.mjs`（签批闭环同步 / 度量看板 / 治理契约审计）、`selftest.mjs`（自动化自测）、`export-bundle.mjs`（重新生成本包）、`lib/runbook.mjs`（台账解析公共库） |
 
 ## 快速导入
 
@@ -22,7 +22,7 @@
 1. 把 `OpenCode-Agent版/.opencode/` 与 `scripts/` 复制到目标仓库根目录；
 2. 新会话默认由 `router` 接管（`default_agent: router`），输入即自动分诊派单并在 `docs/expert-team/runbook/` 审计留痕；
 3. 常驻监听本地新提交：`node scripts/autodispatch-watcher.mjs --interval 60`；
-4. 自检：`node scripts/validate-expert-team.mjs`（应 38 通过 / 0 失败）。
+4. 自检：`node scripts/validate-expert-team.mjs`（应全部通过 / 0 失败）、`node scripts/selftest.mjs`、`node scripts/guard-audit.mjs`
 
 ## 治理边界（不随部署而放宽）
 - **一事一 A**：每事项仅 1 个人类 Accountable；Agent 只写 R/C，永远不占 A、不代签、不放行；

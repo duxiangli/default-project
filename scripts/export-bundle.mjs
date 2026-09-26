@@ -141,6 +141,14 @@ await cp(join(ROOT, '.opencode'), join(STAGE, 'OpenCode-Agent版', '.opencode'),
 for (const f of await readdir(join(ROOT, 'scripts'))) {
   if (f.endsWith('.mjs')) await cp(join(ROOT, 'scripts', f), join(STAGE, 'scripts', f));
 }
+// 顶层 *.mjs 之外，还必须带上 scripts/lib 整个目录：
+// 漏掉它会让包内 approval-sync / dispatch-metrics / guard-audit 的
+// `import ... from './lib/runbook.mjs'` 失败 —— 即「交付包发出去就是坏的」。
+// 2026-09-27 由 expert/20-docs 在真实派单评审（DSP-20260927-0020-02）中查出。
+for (const extra of ['lib', 'install-autostart.ps1']) {
+  try { await cp(join(ROOT, 'scripts', extra), join(STAGE, 'scripts', extra), { recursive: true }); }
+  catch { /* 该项不存在则跳过 */ }
+}
 await cp(join(ROOT, 'docs', '交付包-README.md'), join(STAGE, 'README.md'));
 
 const fileNames = [];
@@ -172,6 +180,29 @@ for (const k of ['首席名册.csv', '派单日志.md', '待签批清单.md', '�
   if (![...got].some((n) => n.includes(k))) missing.push(k);
 }
 if (missing.length) { console.error('自检失败，缺少:', missing.join(' | ')); process.exit(1); }
+// 依赖闭合校验：包内每个 .mjs 的相对 import 目标必须在包内存在。
+// 这条断言直接对应「漏 scripts/lib 导致包内脚本不可运行」这一真实缺陷。
+{
+  const bad = [];
+  // 不用 new URL()：它会把中文目录名百分号编码，导致「存在的文件」也被判为缺失
+  const resolveRel = (baseDir, rel) => {
+    const parts = baseDir.split('/').filter(Boolean);
+    for (const seg of rel.split('/')) {
+      if (!seg || seg === '.') continue;
+      if (seg === '..') parts.pop(); else parts.push(seg);
+    }
+    return parts.join('/');
+  };
+  for (const e of back) {
+    if (!e.name.endsWith('.mjs')) continue;
+    const dir = e.name.slice(0, e.name.lastIndexOf('/') + 1);
+    for (const m of e.data.toString('utf8').matchAll(/from\s+['"](\.[^'"]+)['"]/g)) {
+      const target = resolveRel(dir, m[1]);
+      if (!got.has(target)) bad.push(`${e.name} → ${m[1]}（解析为 ${target}）`);
+    }
+  }
+  if (bad.length) { console.error(`自检失败：包内相对依赖缺失 ${bad.length} 处:`, bad.slice(0, 5).join('; ')); process.exit(1); }
+}
 if (back.some((e) => e.name.startsWith('.')) || back.some((e) => e.name.includes('./'))) {
   console.error('自检失败：存在不友好前缀条目'); process.exit(1);
 }

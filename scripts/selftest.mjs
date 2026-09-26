@@ -13,6 +13,7 @@ import {
   REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
 } from './autodispatch-watcher.mjs';
+import { classifyVerdict } from './lib/runbook.mjs';
 
 let pass = 0;
 const fails = [];
@@ -170,14 +171,11 @@ console.log('\n[9] 回归：git 路径不做八进制转义（否则路径路由
   if (names === null) {
     console.log('  ⏭  非 git 环境或无 HEAD，跳过');
   } else {
+    // 核心属性 = 没有八进制转义；中文文件名以真实字符出现时再确认其非编码形态
     const hasOctal = /\\[0-3][0-7]{2}/.test(names);
     truthy(!hasOctal, '输出不含八进制转义序列（core.quotepath=false 生效）');
-    // 仓库里有中文名文件时，断言其以真实字符出现
-    if (/[\u4e00-\u9fa5]/.test(names) || /审批记录|派单日志|待签批清单/.test(names)) {
-      truthy(/审批记录|派单日志|待签批清单/.test(names), '中文文件名以真实字符返回（可被路径路由规则匹配）');
-    } else {
-      ok('本次 HEAD 未触及中文名文件，跳过中文断言');
-    }
+    if (/[\u4e00-\u9fa5]/.test(names)) ok('中文文件名以真实字符返回（非转义形态）');
+    else ok('本次 HEAD 未触及中文名文件，跳过中文断言');
   }
 }
 
@@ -276,6 +274,24 @@ console.log('\n[12] 熔断状态机（连续失败自动熔断，防无限重试
   eq(strict.state, 'open', 'threshold=1 时首次失败即熔断');
   truthy(parseFlags(['--reset-breaker']).resetBreaker, '--reset-breaker 参数解析');
   eq(BREAKER_DEFAULTS.threshold, 3, '默认阈值 3');
+}
+
+console.log('\n[13] 四态解析顺序回归（expert/20-docs 在 DSP-20260927-0020-02 查出）');
+{
+  // 「有条件批准」必须解析为「有条件」，绝不能被 /批准/ 抢先匹配
+  eq(classifyVerdict('有条件批准').verdict, '有条件', '「有条件批准」→ 有条件');
+  eq(classifyVerdict('有条件批准（签批人 duxiangli）').verdict, '有条件', '带后缀的「有条件批准」仍为 有条件');
+  eq(classifyVerdict('建议批准').verdict, '批准', '专家建议「建议批准」→ 批准');
+  eq(classifyVerdict('批准').verdict, '批准', '人类签批「批准」→ 批准');
+  eq(classifyVerdict('驳回').verdict, '驳回', '驳回');
+  eq(classifyVerdict('需人工').verdict, '需人工', '需人工');
+  eq(classifyVerdict('有条件').verdict, '有条件', '专家建议「有条件」→ 有条件');
+  eq(classifyVerdict('驳回/高').severity, '高', '严重度抽取不受四态顺序影响');
+  eq(classifyVerdict('需人工/中').severity, '中', '严重度「中」');
+  eq(classifyVerdict('建议批准/低').verdict, '批准', '组合表述先判四态');
+  eq(classifyVerdict('建议批准/低').severity, '低', '组合表述同时抽严重度');
+  eq(classifyVerdict('').verdict, null, '空输入不猜');
+  eq(classifyVerdict('配置就绪').verdict, null, '无关文本不臆断四态');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fails.length} 失败`);
