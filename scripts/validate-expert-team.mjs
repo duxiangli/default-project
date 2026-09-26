@@ -357,5 +357,39 @@ if (approvalLogText && !/approval-ledger-begin/.test(approvalLogText)) assetIssu
 if (assetIssues.length === 0) ok(`自动化资产：${autoAssets.length} 个脚本就绪 + watcher 加固在位 + 视图/锚点齐备`);
 else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
 
+/* ── 15. 台账表格结构（空行断表 / 列数 / 收尾竖线 / 锚点位置） ── */
+{
+  const structIssues = [];
+  const specs = [
+    ['runbook/派单日志.md', /^\| DSP-/, 9, '<!-- dispatch-log-end -->'],
+    ['runbook/待签批清单.md', /^\| AP-/, 9, '<!-- pending-approval-end -->'],
+    ['runbook/审批记录.md', /^\| AP-/, 13, '<!-- approval-ledger-end -->'],
+  ];
+  for (const [rel, rowRe, cols, anchor] of specs) {
+    const t = await rd(path.join(docDir, rel));
+    const ls = t.split('\n');
+    const dataIdx = ls.map((l, i) => (rowRe.test(l) ? i : -1)).filter((i) => i >= 0);
+    if (!dataIdx.length) { structIssues.push(`${rel}: 无数据行`); continue; }
+    // (a) 数据行之间不得有空行——空行会把 Markdown 表断成两段，解析器只读到第一段
+    for (let k = 1; k < dataIdx.length; k++) {
+      if (ls.slice(dataIdx[k - 1] + 1, dataIdx[k]).some((l) => l.trim() === '')) {
+        structIssues.push(`${rel}:${dataIdx[k] + 1} 前有空行，表被断开`);
+      }
+    }
+    // (b) 列数一致 + 收尾竖线
+    for (const i of dataIdx) {
+      const n = ls[i].split('|').slice(1, -1).length;
+      if (n !== cols) structIssues.push(`${rel}:${i + 1} 列数 ${n}≠${cols}`);
+      if (!ls[i].trimEnd().endsWith('|')) structIssues.push(`${rel}:${i + 1} 缺收尾竖线`);
+    }
+    // (c) 锚点必须位于最后一行数据之后，否则新追加的行会被解析器忽略
+    const aIdx = ls.findIndex((l) => l.includes(anchor));
+    if (aIdx === -1) structIssues.push(`${rel}: 缺锚点`);
+    else if (aIdx < dataIdx[dataIdx.length - 1]) structIssues.push(`${rel}: 锚点在末行数据之前`);
+  }
+  if (structIssues.length === 0) ok('台账结构：三表无空行断表、列数与收尾竖线一致、锚点在末行数据之后');
+  else bad(`台账结构问题: ${structIssues.slice(0, 4).join('; ')}${structIssues.length > 4 ? ' …' : ''}`);
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
