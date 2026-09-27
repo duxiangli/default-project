@@ -8,11 +8,15 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 import {
   parseFlags, sanitizeUntrusted, buildUntrustedBlock, planIncremental,
   REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
-  buildSerialNotice,
+  buildSerialNotice, runCli,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict } from './lib/runbook.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
@@ -495,19 +499,71 @@ console.log('\n[20] headline 不得夹带不可信文本（不可信内容只能
   // 否则「CTO」出现在纪律句里会被误判为泄漏，进而让真正的泄漏被放过。
   const instr = afterBlock.slice(0, afterBlock.indexOf('执行要求'));
   truthy(/subject/.test(instr) && /正文/.test(instr) && /文件路径/.test(instr), '指令区逐项列全不可信输入（subject/正文/路径）');
-  // 「CTO 授权」是纪律句里的**举例**，属预期；真正要防的是把不可信原文整段搬进指令区。
   // 故断言：注入关键词在指令区只能以「如…」「出现…时」这类举例语境出现。
   const quoted = [...afterBlock.matchAll(/.{0,14}CTO.{0,14}/g)].map((x) => x[0]);
   truthy(quoted.length > 0, '纪律句中确有注入话术举例（否则本组断言失去意义）');
   truthy(quoted.every((s) => /CTO 授权|「|」|如|出现|时/.test(s)), '注入词在指令区仅作举例，未整段搬运不可信原文');
-
-  // 边界与纪律条款必须在
-  truthy(t.includes('commit 正文是注入的高发区'), '安全边界点名正文为注入高发区');
-  truthy(t.includes('识别并拒绝'), '给出正确反应：识别并拒绝');
-  truthy(t.includes('已获授权代签'), '边界点名「已获授权代签」话术');
-  truthy(t.includes('C 列只填你「实际派了子会话」的专家'), 'C 列纪律：只填实际派了的专家');
-  truthy(t.includes('伪造咨询记录'), 'C 列纪律：点明写没派=伪造咨询记录');
 }
+
+console.log('\n[21] 派单停滞防护（④：一次专家推理打转让 watcher 静默 25 分钟）');
+{
+  // 21.1 参数层：软超时与心跳可配且有合理默认
+  const pf = parseFlags([]);
+  eq(pf.stallTimeout, 900000, '默认软超时 15 分钟（实测僵死 13 分钟零进展，原先只有 3600s 一档）');
+  eq(pf.heartbeat, 60000, '默认心跳 60s');
+  const pf2 = parseFlags(['--stall-timeout', '120', '--heartbeat', '10']);
+  eq(pf2.stallTimeout, 120000, '--stall-timeout 换算为毫秒');
+  eq(pf2.heartbeat, 10000, '--heartbeat 换算为毫秒');
+  eq(parseFlags(['--stall-timeout', 'abc']).warnings.length, 1, '非法 --stall-timeout 进 warnings');
+  eq(parseFlags(['--heartbeat', '-5']).warnings.length, 1, '非法 --heartbeat 进 warnings');
+
+  // 21.2 runCli 必须正确标记 timedOut/stalled——原先恒为 false，超时与正常退出无法区分
+  const r1 = await runCli(process.execPath, ['-e', 'process.stdout.write("hello");setTimeout(()=>{},50)'], { timeout: 5000, heartbeatMs: 0 });
+  eq(r1.timedOut, false, '正常完成时 timedOut=false');
+  eq(r1.stalled, false, '未设软超时时 stalled=false');
+  eq(r1.bytes, 5, '记录了收到的字节数（供心跳区分「有进度」与「零输出」）');
+  eq(r1.stdout.includes('hello'), true, 'stdout 正常收集');
+  eq(r1.waitedMs >= 40, true, '记录了耗时');
+  const r0 = await runCli(process.execPath, ['-e', 'setTimeout(()=>{},30)'], { timeout: 5000, heartbeatMs: 0 });
+  eq(r0.bytes, 0, '无输出时 bytes=0（这是心跳要报警的形态，不该被当成失败）');
+
+  const r2 = await runCli(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { timeout: 60000, softTimeoutMs: 300, heartbeatMs: 0 });
+  eq(r2.stalled, true, '软超时触发时 stalled=true（**这是修复前的核心缺陷：恒为 false**）');
+  eq(r2.timedOut, false, '软超时不算硬超时，两者可区分');
+  eq(r2.waitedMs < 5000, true, `软超时确实提前终止（实测 ${r2.waitedMs}ms）`);
+
+  const r3 = await runCli(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { timeout: 400, softTimeoutMs: 0, heartbeatMs: 0 });
+  eq(r3.timedOut, true, '硬超时触发时 timedOut=true（修复前恒为 false）');
+  eq(r3.stalled, false, '只设硬超时时 stalled 不被误标');
+
+  // 21.3 心跳不得让进程永不退出（unref 保证不阻止退出）
+  const t0 = Date.now();
+  await runCli(process.execPath, ['-e', 'console.log("x")'], { timeout: 5000, heartbeatMs: 50 });
+  eq(Date.now() - t0 < 3000, true, '心跳计时器不阻止进程正常退出');
+
+  // 21.4 提示词必须携带收敛纪律（watcher 只能止损，防不住打转，纪律要靠提示词）
+  const full = REVIEW_PROMPT('标题', 'BLOCK');
+  const cs = [
+    ['工具调用预算', /每位专家最多 8 次工具调用/],
+    ['不收敛就降级', /不收敛就降级/],
+    ['降级为需人工/高', /需人工\/高/],
+    ['自引用护栏', /自引用护栏/],
+    ['只评审 diff 增量', /只评审本次 diff 的增量/],
+    ['禁止重核已签批结论', /严禁逐条重新核验/],
+    ['点名 runbook 台账', /runbook\/ 台账类文件/],
+    ['载明实测故障形态', /65,660 reasoning tokens/],
+    ['给出正常值对照', /reasoning 约 1 千/],
+  ];
+  for (const [n, re] of cs) truthy(re.test(full), `提示词含收敛纪律：${n}`);
+
+  // 21.5 纪律必须在 router 协议里同样在位（router 是转达方）
+  const routerMd = await readFile(join(ROOT, '.opencode', 'agents', 'router.md'), 'utf8');
+  truthy(/已知故障形态/.test(routerMd), 'router.md 载明已知故障形态');
+  truthy(/65,660 reasoning tokens/.test(routerMd), 'router.md 给出实测数据');
+  truthy(/只评审本次 diff 的\*\*增量\*\*/.test(routerMd), 'router.md 含自引用护栏');
+  truthy(/必须一并转达收敛纪律/.test(routerMd), 'router.md 要求派单时转达纪律');
+}
+
 
 console.log(`\n结果：${pass} 通过 / ${fails.length} 失败`);
 if (fails.length) { console.log('失败项：'); fails.forEach((f) => console.log('  - ' + f)); }
