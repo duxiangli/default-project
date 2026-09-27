@@ -19,7 +19,7 @@ import {
   buildSerialNotice, runCli, splitExempt, countDispatchRows, sourceFingerprint, EXIT_CODE_STALE, MAX_RESTART_DEPTH,
   effectiveDepth, RESTART_CHAIN_RESET_MS,
 } from './autodispatch-watcher.mjs';
-import { classifyVerdict } from './lib/runbook.mjs';
+import { classifyVerdict, parseSerial } from './lib/runbook.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
 import { matchPathRules, buildDotPathNotice } from './autodispatch-watcher.mjs';
 import { globSync, existsSync } from 'node:fs';
@@ -806,6 +806,74 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
   const crossIds = new Set(crossMd.split(/\r?\n/).filter((l) => /^\| DSP-/.test(l)).map((l) => l.split('|')[1].trim()));
   const missing = dRecs.filter((d) => d.needSign === 'Y' && d.dsp && !crossIds.has(d.dsp.id)).map((d) => d.dsp.id);
   eq(missing.length, 0, `需签批派单全部有核对记录（缺 ${missing.length} 条）`);
+
+  /* 24.7 字段值正确性验证（补 expert/16-devops-sre 在 DSP-20260927-1256-01 提出的缺口）
+   *
+   * 上面那些断言只验「行数对得上」——**解析器把所有字段都解析错了，行数照样对得上**。
+   * 例如 classifyVerdict 若把「有条件批准」误判成「批准」，或 parseSerial 拼错单号，
+   * 前面的关系式断言**一条都不会红**。这正是我从 v1 修过的老问题（顺序导致四态误判），
+   * 说明它随时可能复发，必须在测试里钉死。
+   *
+   * 做法：拿**原始单元格文本**做独立比对，不用被测解析器的输出去验证自己。
+   */
+  const valIssues = [];
+  // (1) 单号：parseSerial 拼出的 id 必须逐字等于原单元格（单号是全链路的连接键）
+  for (const r of book.dispatchTable.rows) {
+    const s = parseSerial(r[0]);
+    if (!s) { valIssues.push(`派单单号无法解析: ${r[0]}`); continue; }
+    if (s.id !== r[0].trim()) valIssues.push(`单号回构不一致: ${r[0]} → ${s.id}`);
+  }
+  for (const r of book.approvalTable.rows) {
+    const s = parseSerial(r[0]);
+    if (!s) { valIssues.push(`审批单号无法解析: ${r[0]}`); continue; }
+    if (s.id !== r[0].trim()) valIssues.push(`审批单号回构不一致: ${r[0]} → ${s.id}`);
+  }
+  // (2) needSign：必须与原始第 9 列的字面 Y/N 严格一致（不经 classifyVerdict，独立比对）
+  dRecs.forEach((d, i) => {
+    const raw = String(book.dispatchTable.rows[i][8] || '').trim();
+    const expect = /^Y$/i.test(raw) ? 'Y' : (/^N$/i.test(raw) ? 'N' : null);
+    if (d.needSign !== expect) valIssues.push(`${d.dsp ? d.dsp.id : '?'}: needSign=${d.needSign} 与原文本「${raw}」不符`);
+  });
+  // (3) 四态：解析出的结论必须落在受控取值内，且原文本里确实含对应关键词
+  const VERDICTS = ['批准', '有条件', '驳回', '需人工'];
+  for (const a of approvalRecords(book)) {
+    if (!VERDICTS.includes(a.conclusion)) valIssues.push(`${a.ap ? a.ap.id : '?'}: 签批结论越界「${a.conclusion}」`);
+    if (!a.conclusion) valIssues.push(`${a.ap ? a.ap.id : '?'}: 签批结论解析为 null`);
+    // 注意：**不要**断言「签批结论必须出现在专家建议原文里」——
+    // 人类签批本就可以与专家建议不同（那正是签批的意义：AP-20260925-1221 专家建议
+    // 需人工、高，人类签的是有条件批准）。我第一版就写了这条无效约束，
+    // 结果 13 处误报——**凭空造出一条不存在的规则，比不写断言更坏**。
+    // 有意义的替代检查：专家建议列本身必须解析出受控四态与合法严重度。
+    const sv = classifyVerdict(a.suggestion);
+    const isSeed = /初始化/.test(a.subject || '');   // 体系初始化行本无专家四态（validate 亦豁免）
+    if (!sv.verdict && !isSeed) valIssues.push(`${a.ap ? a.ap.id : '?'}: 专家建议列解析不出四态「${a.suggestion.slice(0, 24)}」`);
+    if (sv.verdict && !sv.severity && !isSeed) valIssues.push(`${a.ap ? a.ap.id : '?'}: 专家建议缺严重度`);
+    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(a.signedAt)) valIssues.push(`${a.ap ? a.ap.id : '?'}: 签批时间格式错「${a.signedAt}」`);
+  }
+  dRecs.forEach((d, i) => {
+    if (!VERDICTS.includes(d.verdict) && d.verdict !== null) valIssues.push(`${d.dsp ? d.dsp.id : '?'}: 结论摘要解析出越界四态「${d.verdict}」`);
+    if (!d.humanA) valIssues.push(`${d.dsp ? d.dsp.id : '?'}: 人类A 为空`);
+    // R 列：正常评审行必须有 R；但**幂等跳过行**（router 识别到提交已评审、未重复派单）
+    // 的 R/C/派发如实写「—」是正确的，不该判违规。
+    // 我第一版一刀切要求 R，把 3 条幂等跳过行误判为异常——**误报同样是缺陷**。
+    const isSkip = /幂等跳过/.test(book.dispatchTable.rows[i][7] || '');
+    if (!isSkip && (!d.R || !/路由Agent|expert\/[a-z0-9-]+/.test(d.R))) {
+      valIssues.push(`${d.dsp ? d.dsp.id : '?'}: 非幂等跳过行的 R 列异常「${d.R}」`);
+    }
+  });
+  // (4) 跨表连接键：AP 与 DSP 的尾号必须一致（台账「单号规则」明确要求一一对应）
+  const apIds = new Set(approvalRecords(book).map((a) => a.ap && a.ap.id).filter(Boolean));
+  for (const p of pendingRecords(book)) {
+    if (!p.ap || !p.dsp) { valIssues.push(`${p.ap ? p.ap.id : '?'}: 缺少可解析的 AP/DSP 单号`); continue; }
+    if (p.ap.seq !== p.dsp.seq) valIssues.push(`${p.ap.id} 与 ${p.dsp.id} 序号位不一致（约定要求尾号一一对应）`);
+  }
+  // (5) 每笔台账签批都必须在待签批队列有对应行（否则 approval-sync 会报孤儿）
+  const pendIds = new Set(pendingRecords(book).map((p) => p.ap && p.ap.id).filter(Boolean));
+  for (const a of approvalRecords(book)) {
+    if (a.ap && !pendIds.has(a.ap.id)) valIssues.push(`孤儿签批 ${a.ap.id}（台账有、队列无）`);
+  }
+  truthy(valIssues.length === 0, `字段值正确性：单号回构/needSign/四态取值/时间格式/AP-DSP 尾号对应/孤儿签批 全部一致（${valIssues.length} 处异常）`);
+  if (valIssues.length) valIssues.slice(0, 5).forEach((x) => console.log(`      · ${x}`));
 }
 
 
