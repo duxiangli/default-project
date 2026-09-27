@@ -722,18 +722,38 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
   // 把进程打崩、watcher 静默停摆——**而上面所有断言全绿**，
   // 因为它们只验了「位置顺序」与「文本里有没有这个词」，**没有一个验运行时有效性**。
   // 这是断言方式的结构性缺陷：文本断言能证明代码「写了什么」，不能证明它「跑不跑得起来」。
+  // 24.5 冒烟测试：**真的把 watcher 跑常驻模式**，等漂移定时器至少 tick 一次
+  //
+  // 血泪史（两版）：
+  // v1 跑 `--once --health` → 该模式在 `if (flags.once)` 分支就 return，
+  //    **根本走不到创建 driftTimer 的常驻分支**，所以捕获不到那个 TDZ 崩溃。
+  //    被 expert/16-devops-sre 在 DSP-20260927-2122-01 指出。我写它的动机明明是
+  //    「文本断言证明不了跑不跑得起来」，结果它自己也是文本层面的安慰。
+  // v2（本版）跑常驻模式，且**先断言确实走到了目标代码路径**——
+  //    若没走到就判 FAIL 而不是静默通过。**冒烟测试自己必须能被判为无效**，
+  //    否则它就是第二个假保证。
+  //
+  // 用全新 state 文件 → 首轮只建基线、不派单、不探活，故不触网、无需凭据。
+  // 漂移定时器间隔 = max(30s, min(interval,300)s)，故 --interval 5 仍取 30s 下限，
+  // 跑 40s 可确保至少 tick 一次。
+  const SMOKE_MS = 40000;
   const smoke = await new Promise((resolve) => {
     const out = [];
     const p = spawn(process.execPath, [join(ROOT, 'scripts', 'autodispatch-watcher.mjs'),
-      '--once', '--health', '--state', join(tmp, 'smoke-state.json')], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    const cap = Date.now() + 45000;
+      '--interval', '5', '--state', join(tmp, 'smoke-state2.json')],
+    { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const killer = setTimeout(() => { try { p.kill(); } catch { /* 已退出 */ } }, SMOKE_MS);
     p.stdout.on('data', (d) => out.push(String(d)));
-    p.stderr.on('data', (d) => out.push('STDERR:' + d));
-    const t = setInterval(() => { if (Date.now() > cap) { clearInterval(t); try { p.kill(); } catch { /* 已退出 */ } } }, 500);
-    p.on('close', () => { clearInterval(t); resolve(out.join('')); });
+    p.stderr.on('data', (d) => out.push('\nSTDERR:' + d));
+    p.on('close', () => { clearTimeout(killer); resolve(out.join('')); });
   });
-  truthy(!/ReferenceError/.test(smoke), '冒烟：watcher 实际运行无 ReferenceError');
-  truthy(!/is not defined/.test(smoke), '冒烟：无「变量未定义」类错误');
+  // 关键：先验「确实走到了常驻分支」，否则下面两条断言毫无意义
+  const reachedResident = /源码指纹/.test(smoke);
+  truthy(reachedResident, '冒烟前置：确实进入了常驻分支（打了源码指纹）——否则本次冒烟无效');
+  truthy(/基线已建立|首次运行/.test(smoke), '冒烟：首轮只建基线、不派单（保持零凭据）');
+  truthy(!/ReferenceError/.test(smoke), '冒烟：常驻 ≥30s 无 ReferenceError');
+  truthy(!/is not defined/.test(smoke), '冒烟：无「变量未定义」类错误（TDZ 即此类）');
+  truthy(!/stopping is not defined/.test(smoke), '冒烟：漂移定时器回调未触发 stopping TDZ');
   // 漂移定时器要真能被创建成功：跑 --health --once 时不进入常驻分支，
   // 故用「代码里 stopping 声明早于定时器」这条静态断言补位（两者一起才够）
   const iStop = m.indexOf('let stopping = false');
