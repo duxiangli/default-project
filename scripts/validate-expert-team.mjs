@@ -409,6 +409,45 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
   }
   if (semIssues.length === 0) ok('台账语义：审批台账 13 列的单号/日期/时间/R/四态/结论均落在正确列');
   else bad(`台账语义错位 ${semIssues.length} 处: ${semIssues.slice(0, 3).join('; ')}${semIssues.length > 3 ? ' …' : ''}`);
+
+  // (c) 双方核对强制：每条需签批=Y 的派单都必须在「核对记录」有对应行，且不成立必须附可验证反证
+  const CROSS_FILE = 'runbook/核对记录.md';
+  const crossIssues = [];
+  let crossText = '';
+  try { crossText = await rd(path.join(docDir, CROSS_FILE)); }
+  catch { crossIssues.push(`缺 ${CROSS_FILE}（双方核对台账）`); }
+  if (crossText) {
+    // 必备纪律条款
+    for (const [label, re] of [
+      ['原话留存条款', /原话留存/],
+      ['不成立须附反证条款', /不成立须附反证/],
+      ['禁止用相反事实代替反证', /只陈述相反事实不算反证/],
+    ]) if (!re.test(crossText)) crossIssues.push(`核对记录缺「${label}」`);
+
+    const crossRows = crossText.split('\n').filter((l) => /^\| DSP-/.test(l));
+    const crossIds = new Set(crossRows.map((l) => (l.split('|')[1] || '').trim()));
+    // 需签批派单直接读台账文本（不依赖外部变量，避免作用域陷阱）
+    const needCross = dispatchLogText.split('\n')
+      .filter((l) => /^\| DSP-/.test(l) && /\| Y\s*\|?\s*$/.test(l.trim()))
+      .map((l) => (l.split('|')[1] || '').trim())
+      .filter(Boolean);
+    const noCross = needCross.filter((id) => !crossIds.has(id));
+    if (noCross.length) crossIssues.push(`${noCross.length} 条需签批派单无核对记录: ${noCross.slice(0, 3).join(',')}`);
+    // 核对结论取值受控（容忍 Markdown 加粗等包装：先剥掉 ** 与空格再判）
+    for (const l of crossRows) {
+      const c = l.split('|').slice(1, -1).map((x) => x.trim());
+      const v = String(c[4] || '').replace(/\*\*/g, '').replace(/\s+/g, '');
+      if (!/^(成立|部分成立|不成立)/.test(v)) crossIssues.push(`${c[0]}: 复核结论取值异常「${String(c[4] || '').slice(0, 16)}」`);
+      // 判不成立必须有可复现的反证
+      if (/^不成立/.test(v) && !/反证|ls-files|命令|输出|可复现|重跑/.test(c[5] || '')) {
+        crossIssues.push(`${c[0]}: 判「不成立」但未给可验证反证`);
+      }
+      if (!c[2] || /^\s*$/.test(c[2])) crossIssues.push(`${c[0]}: 缺专家原始结论（不得只留复核结论）`);
+      if (!c[3] || /^\s*$/.test(c[3])) crossIssues.push(`${c[0]}: 缺复核方式（须写清核了什么）`);
+    }
+    if (crossIssues.length === 0) ok(`双方核对：${needCross.length} 条需签批派单全部有核对记录，复核结论取值受控、不成立均附反证`);
+    else bad(`双方核对问题: ${crossIssues.slice(0, 4).join('; ')}${crossIssues.length > 4 ? ' …' : ''}`);
+  }
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
