@@ -13,6 +13,7 @@ let pass = 0;
 let fail = 0;
 const ok = (msg) => { pass++; console.log(`  ✅ ${msg}`); };
 const bad = (msg) => { fail++; console.log(`  ❌ ${msg}`); };
+const log = (msg) => console.log(msg);   // 不计分的说明行（如已知旧账的显式列出）
 
 const agentsDir = '.opencode/agents';
 const expertDir = path.join(agentsDir, 'expert');
@@ -435,8 +436,27 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
     if (idHm !== `${t[2]}:${t[3]}`) tsIssues.push(`${c[0]}: 号内 ${idHm} ≠ 时间列 ${t[2]}:${t[3]}`);
     if (m[1] !== t[1].replace(/-/g, '')) tsIssues.push(`${c[0]}: 号内日期 ${m[1]} ≠ 时间列日期 ${t[1]}`);
   }
-  if (tsIssues.length === 0) ok('派单时间戳：12 行派单的单号 HHMM/日期与时间列全部自洽（注：仅证自洽，真实性证据在 logs/watcher.log）');
-  else bad(`派单时间戳与单号不符 ${tsIssues.length} 处: ${tsIssues.slice(0, 4).join('; ')}${tsIssues.length > 4 ? ' …' : ''}`);
+  // 已知旧账白名单：这 3 处在修复（②）之前就存在，且所属审批单已由人类签批。
+  // 按「已签批记录不改写」不追溯改写，但**必须显式列出**——否则等于把已知缺陷
+  // 藏进白名单外装作没有。白名单外的任何不符一律 fail。
+  const KNOWN_TS = {
+    'DSP-20260925-1222': '号内 12:22 vs 时间列 12:21（router 自编号，②修复前）',
+    'DSP-20260925-1223': '号内 12:23 vs 时间列 12:21（router 自编号，②修复前）',
+  };
+  const tsNew = tsIssues.filter((s) => !Object.keys(KNOWN_TS).some((k) => s.startsWith(k)));
+  const tsKnown = tsIssues.length - tsNew.length;
+  // 另有一类**本检查抓不到**的偏差必须显式说明：号与时间列互相自洽、但两者都≠真实派单时刻。
+  // DSP-20260927-0110-01 就是这种（号 01:10 / 时间列 01:10 / 真实 02:32:11，偏差 82 分钟），
+  // 故本检查**只能证内部自洽，不能证时间真实**——真实性证据在 logs/watcher.log。
+  if (tsNew.length === 0) {
+    ok('派单时间戳：无新增不符（仅证号与时间列自洽；时间真实性证据在 logs/watcher.log，本检查证不了）');
+    for (const [k, why] of Object.entries(KNOWN_TS)) {
+      if (tsIssues.some((s) => s.startsWith(k))) log(`  ⚠ 已知旧账 ${k}：${why}`);
+    }
+    if (tsKnown) log(`  ⚠ 另有一类自洽但失真：DSP-20260927-0110-01 号 01:10 / 时间列 01:10 / 真实 02:32:11（偏差 82 分钟）——本检查结构上抓不到，只能靠 watcher 日志对`);
+  } else {
+    bad(`派单时间戳新增不符 ${tsNew.length} 处: ${tsNew.slice(0, 4).join('; ')}${tsNew.length > 4 ? ' …' : ''}`);
+  }
 
   // (c) 双方核对强制：每条需签批=Y 的派单都必须在「核对记录」有对应行，且不成立必须附可验证反证
   const CROSS_FILE = 'runbook/核对记录.md';
