@@ -688,6 +688,28 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
   // 关键回归：轮询定时器绝不能被 unref，否则常驻进程会立刻退出
   truthy(!/const timer = setInterval\(runOnce[\s\S]{0,200}?timer\.unref/.test(w), '轮询定时器未被 unref（unref 会让常驻立刻退出）');
 
+  // 24.4 指纹基线必须在**首轮派单之前**采集（实测发现的第三个缺陷）
+  //
+  // 原实现在 `await runOnce()` 之后才采集 fp0。后果有两层，第二层更阴：
+  //   ① 首轮派单期间（实测跑过 28 分钟）完全没有漂移检测；
+  //   ② 首轮结束后 fp0 会把**改后**的指纹记成基线 → 这次改动被**静默接受**，
+  //      正是本机制要防的「看似正常、实则跑旧代码」。
+  // 注意：只能在 **main() 函数体内**比顺序。跨整个文件比是错的——
+  // poll() 定义在 main() 之前，于是文件文本位置 ≠ 执行顺序。
+  // （我第一版就写了 `indexOf('await dispatch(cli') < indexOf(fp0)` 这种跨文件比较，断言不成立。）
+  const mainAt = w.indexOf('async function main()');
+  truthy(mainAt > 0, '找到 main()');
+  const m = w.slice(mainAt);
+  const iFp = m.indexOf('const fp0 = await sourceFingerprint()');
+  const iRun = m.indexOf('await runOnce();');
+  const iTimer = m.indexOf('setInterval(runOnce');
+  truthy(iFp > 0 && iRun > 0 && iTimer > 0, 'main() 内三个锚点都存在');
+  truthy(iFp < iRun, '指纹基线在首轮 runOnce 之前采集（否则首轮期间的改动会被静默接受）');
+  truthy(iFp < iTimer, '指纹基线在轮询定时器之前采集');
+  // 反向断言：漂移逻辑不得又跑回首轮派单之后
+  truthy(!/await runOnce\(\);[\s\S]*const fp0 = await sourceFingerprint/.test(m),
+    '漂移逻辑没有跑回首轮派单之后（防止再次回退）');
+
   // 24.3 三张台账的 begin/end 锚点必须齐全，且 begin 紧贴表头之前
   const RUNBOOK = join(ROOT, 'docs', 'expert-team', 'runbook');
   for (const [file, beg, end] of [

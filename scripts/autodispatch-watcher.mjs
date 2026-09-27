@@ -1171,31 +1171,14 @@ async function main() {
     } finally { inFlight = false; }
   };
 
-  await runOnce();
-  if (flags.once) {
-    // 单次模式不重启，但若状态里记的指纹与当前不一致，说明**常驻跑的是旧代码**——必须告警
-    try {
-      const st = await loadState(flags, { persist: false });
-      const cur0 = st.repos[repoKey];
-      const fpNow = await sourceFingerprint();
-      if (cur0 && cur0.codeFingerprint && fpNow && cur0.codeFingerprint !== fpNow) {
-        log(`[!] 源码已变更（${cur0.codeFingerprint} → ${fpNow}），**常驻进程仍在跑旧代码**，需重启常驻才生效`);
-      }
-    } catch { /* 读状态失败不影响单次结论 */ }
-    await release();
-    return;
-  }
-
-  let stopping = false;
-  const timer = setInterval(runOnce, flags.interval * 1000);
-  // 注意：不要 unref 轮询定时器——它是常驻进程存活的原因，unref 会让进程立刻退出。
-
   /* ── 源码漂移自检：ESM 不热更新，改了源码不重启就一直跑旧逻辑 ──
    *
    * 2026-09-27 实测踩过：改了 autodispatch-watcher.mjs 后常驻毫无反应，
    * 我从进程命令行 grep 新纪律关键词才发现它发的是旧提示词，差点误判「修改无效」。
    *
-   * 处置：常驻模式下发现漂移就**以退出码 75 退出**，由计划任务的
+   * 处置：常驻模式下发现漂移即**自 spawn 一个脱离的替代进程**并退出（不依赖计划任务的
+   * -RestartCount——实测那条路径 7 分钟内毫无反应，见 spawnRestart 的注释）。
+   * `--once` 单次模式不退出（无常驻可重启），只告警。
    * `-RestartCount 3 -RestartInterval 5min` 自动重启并加载新代码。
    * 选这条而不是自己 spawn 替代身：进程树更浅、Windows 上更不容易出僵尸。
    * `--once` 单次模式**不**退出（一次性调用没有常驻可重启），只告警。
@@ -1232,6 +1215,25 @@ async function main() {
     process.exit(EXIT_CODE_STALE);
   }, Math.max(30000, Math.min(flags.interval, 300) * 1000));
   driftTimer.unref?.();
+
+  await runOnce();
+  if (flags.once) {
+    // 单次模式不重启，但若状态里记的指纹与当前不一致，说明**常驻跑的是旧代码**——必须告警
+    try {
+      const st = await loadState(flags, { persist: false });
+      const cur0 = st.repos[repoKey];
+      const fpNow = await sourceFingerprint();
+      if (cur0 && cur0.codeFingerprint && fpNow && cur0.codeFingerprint !== fpNow) {
+        log(`[!] 源码已变更（${cur0.codeFingerprint} → ${fpNow}），**常驻进程仍在跑旧代码**，需重启常驻才生效`);
+      }
+    } catch { /* 读状态失败不影响单次结论 */ }
+    await release();
+    return;
+  }
+
+  const timer = setInterval(runOnce, flags.interval * 1000);
+  // 注意：不要 unref 轮询定时器——它是常驻进程存活的原因，unref 会让进程立刻退出。
+
 
   const stop = async (sig) => {
     if (stopping) return;
