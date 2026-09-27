@@ -164,7 +164,45 @@ export function matchPathRules(files, rulesCsv) {
   return { matched, experts: [...experts], gates: [...gates], maxLevel, hitFileCount: hitFiles.size };
 }
 
-export const REVIEW_PROMPT = (headline, untrusted, pre = null) => `${headline}
+/**
+ * 点路径（dot-path）清单：评审工具的结构性盲区。
+ *
+ * 实测 2026-09-27：opencode 的 `glob` 工具默认 `hidden:false`，`**` 不匹配前导点，
+ * 于是 `.github/`、`.gitignore`、`.opencode/` 对专家**完全不可见**。
+ * 后果是专家用默认 glob 核验高风险 dot 路径时，必然得出「文件不存在」的错误结论——
+ * 而 `路径路由规则.csv` 恰恰把 `.github/workflows/` 定为高风险：
+ * **最该被看见的路径，正好是工具看不见的那一类。**
+ *
+ * 修法与路由预判同源：脚本已经知道本批变更了哪些文件，直接把点路径列出来，
+ * 不让 LLM 去「发现」它们；同时规定核验方式（git ls-files / glob hidden:true）。
+ *
+ * @param {string[]} files 本批变更文件（相对仓库根）
+ * @returns {{dotFiles: string[], dirs: string[], block: string}}
+ */
+export function buildDotPathNotice(files) {
+  // 同时接受 / 与 \ 分隔符：git 输出恒为正斜杠，但换数据源时漏判点路径＝盲区重现，宁可多认
+  const DOT_SEG = /(^|[\\/])\./;
+  const list = (files || []).filter((f) => DOT_SEG.test(String(f)));
+  const dirs = [...new Set(list.map((f) => String(f).split(/[\\/]/).find((s) => s.startsWith('.')) || '(根)'))];
+  const block = list.length
+    ? [
+      '',
+      '## 点路径清单（脚本从本批变更文件里直接列出，勿再用 glob 去「发现」它们）',
+      `- 本批变更含 ${list.length} 个点路径文件，涉及点目录：${dirs.join('、')}`,
+      ...list.slice(0, 12).map((f) => `  - ${sanitizeUntrusted(f, 160)}`),
+      list.length > 12 ? `  - …(共 ${list.length} 个，完整清单见上方不可信数据块)` : '',
+      '',
+      '⚠ **评审工具盲区（实测）**：glob 工具默认 `hidden:false`，`**` 不匹配前导点，',
+      '  因此 `.github/`、`.gitignore`、`.opencode/` 用默认 glob 一律查不到——**返回空不等于文件不存在**。',
+      '  核验点路径必须用其一：`git ls-files <路径>`（推荐，可证被跟踪）或**显式点路径模式** `glob(".github/**/*")`。',
+      '  **禁止**仅凭默认 glob（`**/*`）返回空就写「文件缺失/门禁断裂」——实测该模式对本仓库 0 个点路径可见；',
+      '  若确实要断言缺失，须给出 `git ls-files <路径>` 空输出的命令证据。',
+    ].join('\n')
+    : '';
+  return { dotFiles: list, dirs, block };
+}
+
+export const REVIEW_PROMPT = (headline, untrusted, pre = null, dot = null) => `${headline}
 
 ${untrusted}
 
@@ -181,7 +219,7 @@ ${untrusted}
 3. 先查 docs/expert-team/runbook/派单日志.md：若本批 commit 已有评审记录，只补差异，不重复派单；
 4. 按 #派单留痕 追加审计记录（派单号 DSP-YYYYMMDD-HHMM-NN，严格遵守「写入五戒」）；需签批项按 #待签批清单 入队（AP 号尾号与 DSP 一致，状态只能写「待签批」）；
 5. 输出：事项分发摘要 + 专家建议汇总（四态＋严重度）＋ 待人类A签批清单 + 7 道门禁状态；
-6. 边界不变：只出建议，不占A、不代签、不放行；router 与专家的可写文件仍仅「派单日志.md」「待签批清单.md」。${pre && pre.block ? `\n${pre.block}` : ''}`;
+6. 边界不变：只出建议，不占A、不代签、不放行；router 与专家的可写文件仍仅「派单日志.md」「待签批清单.md」。${pre && pre.block ? `\n${pre.block}` : ''}${dot && dot.block ? `\n${dot.block}` : ''}`;
 
 /* ══════════════ 熔断（纯函数状态机，CI 无模型可测） ══════════════ */
 
@@ -648,11 +686,17 @@ async function poll(ctx) {
       log('路由预判：未命中任何路径规则（按分诊路由表常规处理）');
     }
   } catch (e) { log(`[!] 路由预判跳过（读规则表失败: ${e.message}）`); }
+
+  // 点路径清单：脚本直接列出 .github/ .gitignore .opencode 等文件，避免专家用默认 glob 查不到而误判「缺失」
+  const dot = buildDotPathNotice(files);
+  if (dot.dotFiles.length) log(`点路径清单：${dot.dotFiles.length} 个（${dot.dirs.join('、')}）——已注入核验方式与盲区告警`);
+  else log('点路径清单：本批无点路径变更文件');
+
   const untrusted = buildUntrustedBlock(plan.take, files);
   const headline = `【事件推送·自主评审】本地仓库检测到新提交 ${plan.take.length} 条`
     + `${plan.overflow ? `（另有 ${plan.overflow} 条将在下轮续派）` : ''}：\n`
     + plan.take.map((c) => `${c.hash.slice(0, 8)} ${sanitizeUntrusted(c.subject)}`).join('\n');
-  const text = REVIEW_PROMPT(headline, untrusted, pre);
+  const text = REVIEW_PROMPT(headline, untrusted, pre, dot);
 
   if (flags.dryRun) {
     log(`dry-run：窗口新提交 ${commits.length} 条，本批将派 ${plan.take.length} 条，溢出 ${plan.overflow} 条`);

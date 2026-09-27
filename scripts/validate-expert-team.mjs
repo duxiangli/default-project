@@ -337,6 +337,9 @@ const autoAssets = [
   ['scripts/dispatch-metrics.mjs', /度量看板/, '度量看板'],
   ['scripts/guard-audit.mjs', /契约审计/, '治理契约审计'],
   ['scripts/export-bundle.mjs', /buildZip/, '交付包导出'],
+  ['scripts/export-expert-conclusions.mjs', /session['",\s]+export|OVERREACH/, '专家结论原文导出'],
+  ['scripts/evidence-index.mjs', /提示词版本|输出哈希/, '证据索引生成'],
+  ['scripts/ledger-doctor.mjs', /SPECS/, '台账医生'],
 ];
 const assetIssues = [];
 for (const [f, re, label] of autoAssets) {
