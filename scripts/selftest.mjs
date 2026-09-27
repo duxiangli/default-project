@@ -16,7 +16,7 @@ import {
   parseFlags, sanitizeUntrusted, buildUntrustedBlock, planIncremental,
   REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
-  buildSerialNotice, runCli, splitExempt, countDispatchRows, sourceFingerprint, EXIT_CODE_STALE,
+  buildSerialNotice, runCli, splitExempt, countDispatchRows, sourceFingerprint, EXIT_CODE_STALE, MAX_RESTART_DEPTH,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict } from './lib/runbook.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
@@ -660,13 +660,27 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
   eq(f1, await sourceFingerprint(ROOT), '同一份源码两次计算结果一致（稳定）');
   eq(await sourceFingerprint(join(ROOT, 'no-such-dir')), '', '路径不存在时返回空串（不误判为漂移）');
 
-  // 24.2 漂移必须能被计划任务重启接住
-  eq(EXIT_CODE_STALE, 75, '漂移退出码为 75（非 0，配合计划任务 -RestartCount 自动重启）');
-  truthy(/-RestartCount 3/.test(await readFile(join(ROOT, 'scripts', 'install-autostart.ps1'), 'utf8')),
-    '自启脚本确实配了 -RestartCount（否则漂移退出后无人重启，等于把常驻搞死）');
-  truthy(/EXIT_CODE_STALE/.test(await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8')),
-    'watcher 引用了漂移退出码');
+  // 24.2 漂移后必须能真的重启——**这条曾经是假信心**
+  //
+  // 2026-09-27 实测：我原设计是「漂移→退出码 75→计划任务按 -RestartCount 3/5min 重启」，
+  // 并在 selftest 里断言 `install-autostart.ps1` 配了 `-RestartCount`。**该断言通过。**
+  // 但端到端实测：漂移检测成功打出告警并退出后，计划任务 **7 分钟内毫无反应**
+  // （状态 Ready、LastTaskResult 空、进程 0）。即"配了参数"≠"真的会重启"。
+  // 动作是 cmd 批处理，RestartOnFailure 很可能因此不生效；真实原因未查明（事件日志未启用）。
+  // 所以改成**不依赖它**：watcher 自 spawn 脱离的替代进程。
+  eq(EXIT_CODE_STALE, 75, '漂移退出码为 75（非 0，便于人工与监控识别）');
+  eq(MAX_RESTART_DEPTH, 2, '自重启深度上限为 2（防「改了代码→重启→又检出漂移」死循环）');
   const w = await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8');
+  truthy(/export function spawnRestart/.test(w), '存在自重启函数 spawnRestart');
+  truthy(/detached: true/.test(w) && /child\.unref\(\)/.test(w), '子进程真正脱离父进程（detached + unref）');
+  truthy(/stdio: 'ignore'/.test(w), '子进程 stdio 设为 ignore（不占父进程管道）');
+  truthy(/AUTODISPATCH_START_DELAY_MS/.test(w), '子进程带启动延迟（避开父进程仍持锁的竞态）');
+  truthy(/AUTODISPATCH_RESTART_DEPTH/.test(w), '重启深度经环境变量传递');
+  truthy(/超过上限/.test(w) && /MAX_RESTART_DEPTH/.test(w), '深度超限时拒绝启动（死循环兜底）');
+  truthy(/先放锁，子进程才抢得到/.test(w), '顺序：先释放锁再 spawn（注释即断言）');
+  // 关键回归：绝不能再依赖 -RestartCount
+  truthy(!/交由计划任务重启/.test(w), '漂移日志不再宣称依赖计划任务重启（那句已被实测证伪）');
+  truthy(/实测那条路径 7 分钟内无任何反应/.test(w), '代码里保留了「那条路不可靠」的实测记录');
   truthy(/检测到源码漂移/.test(w), '有明确的漂移告警文案');
   truthy(/仍跑启动时载入的旧代码/.test(w), '告警点明「仍跑旧代码」这个真实后果');
   truthy(/codeFingerprint/.test(w), '指纹落进状态（供 --once 判常驻是否跑旧代码）');
@@ -692,14 +706,30 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
       truthy(ls.length > 2, `${file} 锚点内能读到数据行（${ls.length - 2} 行）`);
     }
   }
-  // 实际解析验证：必须真能读到行，而不是只满足文本形状
+  // 实际解析验证：必须真能读到行，而不是只满足文本形状。
+  // 刻意**不写死行数**——live 会持续派单，写死数字会让这条测试每轮都红，
+  // 而「经常红的测试等于没有测试」，只会训练人忽略它。改为关系式断言。
   const { readRunbook, dispatchRecords, pendingRecords, approvalRecords } = await import('./lib/runbook.mjs');
   const book = await readRunbook(ROOT);
   eq(book.dispatchTable.headers.length, 9, '派单日志解析出 9 列表头');
-  eq(book.dispatchTable.rows.length, 16, '派单日志解析出 16 行数据');
-  eq(pendingRecords(book).length, 14, '待签批清单解析出 14 行');
-  eq(approvalRecords(book).length, 14, '审批台账解析出 14 行');
-  truthy(dispatchRecords(book).filter((d) => d.needSign === 'Y').length === 13, 'needSign=Y 解析为 13 条');
+  truthy(book.dispatchTable.rows.length > 0, `派单日志解析出数据行（${book.dispatchTable.rows.length} 行）`);
+  truthy(book.pendingTable.rows.length > 0, `待签批清单解析出数据行（${book.pendingTable.rows.length} 行）`);
+  truthy(book.approvalTable.rows.length > 0, `审批台账解析出数据行（${book.approvalTable.rows.length} 行）`);
+  // 关系：records 与表行数必须一一对应（解析没漏行也没多行）
+  const dRecs = dispatchRecords(book);
+  eq(dRecs.length, book.dispatchTable.rows.length, 'dispatchRecords 行数与表行数一致（解析无漏/无多）');
+  eq(pendingRecords(book).length, book.pendingTable.rows.length, 'pendingRecords 行数与表行数一致');
+  eq(approvalRecords(book).length, book.approvalTable.rows.length, 'approvalRecords 行数与表行数一致');
+  // 关系：needSign=Y 的条数必须等于原始文本里含 | Y | 的行数（交叉验证解析而非自说自话）
+  const yInText = book.dispatchTable.rows.filter((r) => /\| Y\s*\|?\s*$/i.test(`| ${r[8]} |`.trim())).length;
+  const yParsed = dRecs.filter((d) => d.needSign === 'Y').length;
+  eq(yParsed, yInText, `needSign=Y 解析数（${yParsed}）与文本中实际标记数一致`);
+  truthy(yParsed > 0, '确有需签批派单（该机制不是空转）');
+  // 关系：每个 needSign=Y 的派单都必须在核对台账有对应行（与 validate 第16节同一约束）
+  const crossMd = await readFile(join(ROOT, 'docs', 'expert-team', 'runbook', '核对记录.md'), 'utf8');
+  const crossIds = new Set(crossMd.split(/\r?\n/).filter((l) => /^\| DSP-/.test(l)).map((l) => l.split('|')[1].trim()));
+  const missing = dRecs.filter((d) => d.needSign === 'Y' && d.dsp && !crossIds.has(d.dsp.id)).map((d) => d.dsp.id);
+  eq(missing.length, 0, `需签批派单全部有核对记录（缺 ${missing.length} 条）`);
 }
 
 

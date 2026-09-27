@@ -262,8 +262,43 @@ export async function sourceFingerprint(root = ROOT) {
   return n ? h.digest('hex').slice(0, 16) : '';
 }
 
-/** 源码漂移时给常驻进程用的退出码（非 0，配合计划任务 -RestartCount 自动重启） */
+/** 源码漂移时给常驻进程用的退出码（非 0） */
 export const EXIT_CODE_STALE = 75;
+
+/** 自重启深度上限：超过就不重启，避免「改了代码→重启→又检出漂移→再重启」的死循环 */
+export const MAX_RESTART_DEPTH = 2;
+
+/**
+ * 漂移后自重启：spawn 一个脱离的替代进程，然后自己退出。
+ *
+ * 2026-09-27 实测教训（**不要依赖计划任务的 -RestartCount**）：
+ *   我原以为「漂移→退出码 75→计划任务按 -RestartCount 3/5min 自动重启」能成，
+ *   selftest 里也断言了 `install-autostart.ps1` 确实配了 `-RestartCount`——
+ *   **但那是必要不充分**。实测：漂移检测成功打出告警并退出，
+ *   计划任务随后 7 分钟内**没有任何反应**（状态 Ready、LastTaskResult 为空、进程 0）。
+ *   即那条断言给了假信心，而"配了参数"与"真的会重启"是两件事。
+ *
+ *   动作是 cmd 启动的批处理（logs/run-watcher.cmd），RestartOnFailure 很可能因此不生效；
+ *   真实原因未查明（事件日志未启用，查不到）。**不猜，改成不依赖它。**
+ *
+ * 子进程带 `AUTODISPATCH_START_DELAY_MS`：父进程先释放锁再退出，子进程延迟启动，
+ * 避开「父还持锁、子抢不到锁」的竞态。
+ */
+export function spawnRestart(depth) {
+  const args = process.argv.slice(1);
+  const child = spawn(process.execPath, args, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    env: {
+      ...process.env,
+      AUTODISPATCH_START_DELAY_MS: '3000',
+      AUTODISPATCH_RESTART_DEPTH: String(depth + 1),
+    },
+  });
+  child.unref();
+  return child.pid;
+}
 
 /**
  * 派单日志现有数据行数（只认锚点内、以 `| DSP-` 开头���行）。
@@ -1092,6 +1127,19 @@ async function poll(ctx) {
 async function main() {
   const flags = parseFlags(process.argv.slice(2));
   for (const w of flags.warnings) log(`[warn] ${w}`);
+
+  // 自重启子进程：启动延迟（避开父进程仍持锁的竞态）+ 深度守卫（防无限重启）
+  const restartDepth = Number(process.env.AUTODISPATCH_RESTART_DEPTH || 0);
+  const startDelay = Number(process.env.AUTODISPATCH_START_DELAY_MS || 0);
+  if (restartDepth > MAX_RESTART_DEPTH) {
+    console.error(`自重启深度 ${restartDepth} 超过上限 ${MAX_RESTART_DEPTH}，拒绝启动。`
+      + '这通常意味着源码在持续变动，请人工确认后再手动启动常驻。');
+    process.exit(EXIT_CODE_STALE);
+  }
+  if (startDelay > 0) {
+    log(`自重启子进程（深度 ${restartDepth}/${MAX_RESTART_DEPTH}）：延迟 ${startDelay}ms 启动以避开锁竞态`);
+    await new Promise((r) => setTimeout(r, Math.min(startDelay, 60000)));
+  }
   const dir = flags.projectDir || process.env.AUTODISPATCH_DIR || ROOT;
   const cli = await findCli();
   const repoKey = resolve(dir);
@@ -1172,9 +1220,15 @@ async function main() {
     clearInterval(timer);
     clearInterval(driftTimer);
     log(`[!] **检测到源码漂移**（${fp0} → ${fp}）：本进程仍跑启动时载入的旧代码。`);
-    log(`    以退出码 ${EXIT_CODE_STALE} 退出，交由计划任务重启（已配 -RestartCount 3 / 5min）加载新代码。`);
-    log('    若连续重启仍失败，请查计划任务 LastTaskResult 与 logs/watcher.log。');
-    await release();
+    if (restartDepth >= MAX_RESTART_DEPTH) {
+      log(`⚠ 已自重启 ${restartDepth} 次仍检出漂移，**不再重启**（防死循环）。请人工确认代码是否在持续变动，然后手动重启常驻。`);
+      await release();
+      process.exit(EXIT_CODE_STALE);
+    }
+    await release();                       // 先放锁，子进程才抢得到
+    const pid = spawnRestart(restartDepth);
+    log(`    已自重启：新进程 pid=${pid}（深度 ${restartDepth + 1}/${MAX_RESTART_DEPTH}，延迟 3s 启动以避开锁竞态），本进程以 ${EXIT_CODE_STALE} 退出。`);
+    log('    注：不依赖计划任务的 -RestartCount——实测那条路径 7 分钟内无任何反应。');
     process.exit(EXIT_CODE_STALE);
   }, Math.max(30000, Math.min(flags.interval, 300) * 1000));
   driftTimer.unref?.();
@@ -1194,3 +1248,4 @@ async function main() {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e.message || e); process.exit(1); });
 }
+
