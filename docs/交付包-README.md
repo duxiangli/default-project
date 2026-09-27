@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 跨平台配置包 | `跨平台配置包/docs/expert-team/` | 21 张卡（00-路由Agent + 20 岗位卡）、主文档 00~05、RACI 矩阵 CSV、首席名册、审计/审批台账。导入 **Dify / Coze / LangGraph / AutoGen / GitLab Duo / 自研平台** |
 | OpenCode Agent 版 | `OpenCode-Agent版/.opencode/` | 1 个路由 Agent（primary，自主派单留痕）+ 20 个专家子 Agent（subagent，只读）+ `opencode.jsonc`（`default_agent=router`，MCP gitlab/jira 默认 disabled 样例） |
-| 运维脚本 | `scripts/` | `validate-expert-team.mjs`（体系一致性 14 节校验）、`sync-roster.mjs`（名册 → 岗位卡/Agent/路由表同步）、`autodispatch-watcher.mjs`（本地 git 新提交 → 自主派单监听，零凭据）、`approval-sync.mjs` + `dispatch-metrics.mjs` + `guard-audit.mjs`（签批闭环同步 / 度量看板 / 治理契约审计）、`selftest.mjs`（自动化自测）、`export-bundle.mjs`（重新生成本包）、`lib/runbook.mjs`（台账解析公共库） |
+| 运维脚本 | `scripts/` | `validate-expert-team.mjs`（体系一致性 多节校验）、`sync-roster.mjs`（名册 → 岗位卡/Agent/路由表同步）、`autodispatch-watcher.mjs`（本地 git 新提交 → 自主派单监听，零凭据）、`approval-sync.mjs` + `dispatch-metrics.mjs` + `guard-audit.mjs`（签批闭环同步 / 度量看板 / 治理契约审计）、`selftest.mjs`（自动化自测）、`export-bundle.mjs`（重新生成本包）、`lib/runbook.mjs`（台账解析公共库） |
 
 ## 快速导入
 

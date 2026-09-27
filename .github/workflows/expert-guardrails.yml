@@ -20,7 +20,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: ① 体系一致性校验（14 节：结构/引用/RACI 逐格/名册/门禁阈值/术语/自动化资产）
+      - name: ① 体系一致性校验（结构/引用/RACI 逐格/名册/门禁阈值/术语/自动化资产/免评审白名单/台账语义/时间戳/双方核对/文档去漂移）
         run: node scripts/validate-expert-team.mjs
 
       - name: ② 自动化自测（watcher 纯函数与状态机不变量）

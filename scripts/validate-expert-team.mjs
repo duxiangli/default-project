@@ -4,6 +4,7 @@
  * 校验：Agent 文件完整性/frontmatter/路由引用/岗位卡命名/RACI 双写一致/占位符规范
  */
 import { readdir, readFile as rawReadFile } from 'node:fs/promises';
+import { auditWhitelist } from './lib/whitelist-audit.mjs';
 
 /** 统一归一化换行：CRLF 检出（Windows）下校验结果必须与 LF 检出（Linux CI）一致 */
 const rd = async (p, enc = 'utf8') => (await rawReadFile(p, enc)).replace(/\r\n/g, '\n');
@@ -19,6 +20,8 @@ const agentsDir = '.opencode/agents';
 const expertDir = path.join(agentsDir, 'expert');
 const cardsDir = 'docs/expert-team/agent-cards';
 const docDir = 'docs/expert-team';
+/** 仓库根（白名单语义审计要在整棵文件树上展开模式，需要绝对根路径） */
+const ROOT = process.cwd();
 
 // ── 1. 专家 Agent 文件数量 ──
 const expertFiles = (await readdir(expertDir)).filter((f) => f.endsWith('.md')).sort();
@@ -361,38 +364,55 @@ if (approvalLogText && !/approval-ledger-begin/.test(approvalLogText)) assetIssu
 if (assetIssues.length === 0) ok(`自动化资产：${autoAssets.length} 个脚本就绪 + watcher 加固在位 + 视图/锚点齐备`);
 else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
 
-// 免评审白名单护栏：白名单是「减派单」的口子，必须防住它被用来豁免审计链与门禁本体。
-// 依据（2026-09-27 实测）：scripts/ 下每次改动都产生待签批（watcher/selftest/validate 各 2/2），
-// 而台账类文件各 1 次改动产生待签批 0 次——所以豁免 scripts/ 等于让门禁实现跳过评审。
+// 免评审白名单护栏：**正向语义判定**，不依赖任何样例（重写理由见 scripts/lib/whitelist-audit.mjs）
+//
+// 旧做法是「列禁止类别 + 每类取一个样例路径去试正则」，被 expert/16-devops-sre 在
+// DSP-20260927-1207-01 判为「样本黑名单非语义白名单」——成立。实测可证两洞：
+//   `^scripts/lib/` 命中不了样例 autodispatch-watcher.mjs → 静默豁免台账解析库；
+//   `^\.opencode/agents/expert/` 命中不了样例 router.md → 静默豁免 20 个专家定义。
+// 现在改为：把每条模式在**整个仓库文件树**上展开，逐个判定「是否可证为机器生成」，
+// 存疑即拒；另加「匹配不到任何文件 = 死规则」判 fail。
 {
   const WL = 'raci/免评审白名单.csv';
-  const FORBIDDEN = [
-    ['审批记录', '人类签批台账本身', 'docs/expert-team/runbook/审批记录.md'],
-    ['派单日志', '派单审计留痕', 'docs/expert-team/runbook/派单日志.md'],
-    ['待签批清单', '待签批队列', 'docs/expert-team/runbook/待签批清单.md'],
-    ['核对记录', '双方核对台账', 'docs/expert-team/runbook/核对记录.md'],
-    ['scripts/', '门禁执行代码', 'scripts/autodispatch-watcher.mjs'],
-    ['.github/workflows', 'CI 流水线', '.github/workflows/expert-guardrails.yml'],
-    ['.opencode/agents', 'Agent 协议定义', '.opencode/agents/router.md'],
-  ];
-  const wlIssues = [];
-  let wlRows = [];
-  try {
-    const wl = await rd(path.join(docDir, WL));
-    wlRows = wl.replace(/^\uFEFF/, '').trim().split(/\r?\n/).slice(1).filter((l) => l.trim());
-  } catch { wlIssues.push('缺 ' + WL); }
-  for (const l of wlRows) {
-    const pat = l.split(',')[0];
-    if (!pat) continue;
-    let re = null;
-    try { re = new RegExp(pat, 'i'); } catch { wlIssues.push('白名单正则写错无法编译: ' + pat); continue; }
-    for (const [label, why, sample] of FORBIDDEN) {
-      if (re.test(sample)) wlIssues.push('白名单不得豁免「' + why + '」: ' + pat + '（实测会匹配 ' + sample + '）');
+  // 注意：必须按**路径分段**精确匹配，不能用前缀正则。
+  // 我第一版写 /^(\.git|dist|...)/ 结果 `\.git` 前缀命中了 `.github/`，
+  // 整个 .github 目录被跳过 —— **用来堵洞的护栏自己漏掉了 CI 流水线目录**，
+  // 正是它本该消除的那类盲区。
+  const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'logs', 'free-model-test']);
+  const walk = async (dir, base = "") => {
+    const abs = path.isAbsolute(dir) ? dir : path.join(ROOT, dir);
+    const out = [];
+    let ents = [];
+    try { ents = await readdir(abs, { withFileTypes: true }); } catch { return out; }
+    for (const e of ents) {
+      const rel = base ? base + '/' + e.name : e.name;
+      if (SKIP_DIRS.has(e.name)) continue;
+      if (e.isDirectory()) out.push(...(await walk(path.join(dir, e.name), rel)));
+      else out.push(rel);
+    }
+    return out;
+  };
+  const repoFiles = await walk(ROOT);
+  const headOf = async (rel) => { try { return (await rawReadFile(path.join(ROOT, rel), "utf8")).slice(0, 400); } catch { return ""; } };
+
+  let wlCsv = '';
+  try { wlCsv = await rd(path.join(docDir, WL)); }
+  catch { bad('缺 ' + WL + '（免评审白名单表）'); }
+
+  if (wlCsv) {
+    const audit = await auditWhitelist(wlCsv, repoFiles, headOf);
+    const okRules = audit.rules.filter((r) => r.verdict === 'OK');
+    if (audit.ok) {
+      ok('免评审白名单：' + okRules.length + ' 条规则，逐条在 ' + repoFiles.length
+        + ' 个文件上展开后，所豁免文件**全部可证为机器生成**（非样例比对）');
+      for (const r of okRules) {
+        for (const p of r.gen.slice(0, 4)) log('     · 豁免 ' + p + (r.gen.length > 4 ? ' …' : ''));
+      }
+    } else {
+      bad('免评审白名单问题 ' + audit.issues.length + ' 处: '
+        + audit.issues.slice(0, 3).map((i) => i.msg).join('; ') + (audit.issues.length > 3 ? ' …' : ''));
     }
   }
-  if (!wlIssues.length && wlRows.length) ok('免评审白名单：' + wlRows.length + ' 条派生视图，且未豁免审计链/门禁本体');
-  else if (!wlIssues.length) ok('免评审白名单：未设豁免项（全部改动均需评审）');
-  else bad('免评审白名单问题: ' + wlIssues.slice(0, 3).join('; ') + (wlIssues.length > 3 ? ' …' : ''));
 }
 
 /* ── 15. 台账表格结构（空行断表 / 列数 / 收尾竖线 / 锚点位置） ── */
@@ -402,6 +422,10 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
     ['runbook/派单日志.md', /^\| DSP-/, 9, '<!-- dispatch-log-end -->'],
     ['runbook/待签批清单.md', /^\| AP-/, 9, '<!-- pending-approval-end -->'],
     ['runbook/审批记录.md', /^\| AP-/, 13, '<!-- approval-ledger-end -->'],
+    // 核对台账也纳入：2026-09-27 我在单元格里写 `grep 1.3|14 秒|41.4|秒`，
+    // 3 个裸竖线把一行切成 11 列，而**当时没有任何检查发现**——它不在上面三张表里。
+    // 裸竖线是「台账写入五戒」第 2 条的同款错误（列数不符会让解析器错位读列）。
+    ['runbook/核对记录.md', /^\| DSP-/, 8, null],
   ];
   for (const [rel, rowRe, cols, anchor] of specs) {
     const t = await rd(path.join(docDir, rel));
@@ -421,11 +445,15 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
       if (!ls[i].trimEnd().endsWith('|')) structIssues.push(`${rel}:${i + 1} 缺收尾竖线`);
     }
     // (c) 锚点必须位于最后一行数据之后，否则新追加的行会被解析器忽略
-    const aIdx = ls.findIndex((l) => l.includes(anchor));
-    if (aIdx === -1) structIssues.push(`${rel}: 缺锚点`);
-    else if (aIdx < dataIdx[dataIdx.length - 1]) structIssues.push(`${rel}: 锚点在末行数据之前`);
+    //     核对记录不用 begin/end 锚点（它是纯人读+机器读混合表，不参与追加协议），
+    //     故 anchor 为 null 时跳过本项——但列数检查照做，那才是裸竖线的拦截点。
+    if (anchor) {
+      const aIdx = ls.findIndex((l) => l.includes(anchor));
+      if (aIdx === -1) structIssues.push(`${rel}: 缺锚点`);
+      else if (aIdx < dataIdx[dataIdx.length - 1]) structIssues.push(`${rel}: 锚点在末行数据之前`);
+    }
   }
-  if (structIssues.length === 0) ok('台账结构：三表无空行断表、列数与收尾竖线一致、锚点在末行数据之后');
+  if (structIssues.length === 0) ok('台账结构：四表无空行断表、列数与收尾竖线一致、锚点在末行数据之后（含核对台账列数检查）');
   else bad(`台账结构问题: ${structIssues.slice(0, 4).join('; ')}${structIssues.length > 4 ? ' …' : ''}`);
 
   // 语义校验：台账医生能补「列数」但不知道缺的是哪一列，补错会造成语义错位（如把依据写进建议列）
@@ -447,6 +475,38 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
   }
   if (semIssues.length === 0) ok('台账语义：审批台账 13 列的单号/日期/时间/R/四态/结论均落在正确列');
   else bad(`台账语义错位 ${semIssues.length} 处: ${semIssues.slice(0, 3).join('; ')}${semIssues.length > 3 ? ' …' : ''}`);
+
+  // 文档不得写死「会变的东西」（节数 / 断言数 / 耗时）
+  //
+  // 依据：2026-09-27 连续三轮被专家（DSP-20260927-1207-01 / 2142-01 / 2206-01）
+  // 指出「文档数字漂移」——我把 validate 的节数（14）、selftest 的断言数与耗时
+  // 以文字形式固化进多份文档，每加一组断言就欠一笔债。
+  // 正确做法：**文档只写机制，不写数字**；数字由脚本自报、CI 日志可见。
+  // 故这里做反向检查：文档里若出现硬编码的节数/断言数/耗时，一律 fail。
+  const driftHits = [];
+  const DRIFT_PATTERNS = [
+    { re: /第\s*1\s*[~～]\s*\d+\s*节/, why: 'validate 节数区间（会随新增校验节漂移）' },
+    { re: /扩(到|充至?)\s*\d+\s*节/, why: 'validate 节数（会漂移）' },
+    { re: /(\d+)\s*节(体系)?(一致性)?校验/, why: 'validate 节数（会漂移）' },
+    { re: /selftest[^\n]{0,20}?\d+\s*条断言/, why: 'selftest 断言数（会漂移，应由脚本自报）' },
+    { re: /selftest[^\n]{0,20}?\d+(\.\d+)?\s*s\b/, why: 'selftest 耗时（会随机器漂移）' },
+  ];
+  const DOCS = [
+    'docs/expert-team/04-编排与门禁.md', 'docs/expert-team/05-清单与参考.md',
+    'docs/expert-team/06-门禁阈值与判定口径.md', 'README.md', 'docs/交付包-README.md',
+    '.github/workflows/expert-guardrails.yml',
+  ];
+  for (const d of DOCS) {
+    let txt = '';
+    try { txt = await rd(path.join(ROOT, d)); } catch { continue; }
+    txt.split('\n').forEach((l, i) => {
+      for (const p of DRIFT_PATTERNS) {
+        if (p.re.test(l)) driftHits.push(`${d}:${i + 1} 写死${p.why}：「${l.trim().slice(0, 60)}」`);
+      }
+    });
+  }
+  if (driftHits.length === 0) ok(`文档去漂移：${DOCS.length} 份文档均未写死会变的数字（节数/断言数/耗时）`);
+  else bad(`文档写死了会变的数字 ${driftHits.length} 处（应改为「脚本自报」而非文字固化）: ${driftHits.slice(0, 4).join('; ')}${driftHits.length > 4 ? ' …' : ''}`);
 
   // (c-2) 派单时间戳不得偏离单号 HHMM 位（②）
   //

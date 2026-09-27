@@ -4,7 +4,7 @@
  * 覆盖 watcher v2 的纯函数与状态机不变量——对应 DSP-20260925-1221 提出的
  * 「无测试证据、不可常驻启用」意见。这些断言可在 CI 无模型环境运行。
  */
-import { mkdtemp, mkdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, stat, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -20,6 +20,7 @@ import {
   effectiveDepth, RESTART_CHAIN_RESET_MS,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict, parseSerial } from './lib/runbook.mjs';
+import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
 import { matchPathRules, buildDotPathNotice } from './autodispatch-watcher.mjs';
 import { globSync, existsSync } from 'node:fs';
@@ -617,6 +618,117 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
   // 22.5 参数开关
   eq(parseFlags(['--no-exempt']).noExempt, true, '--no-exempt 可临时关闭豁免（想强制全量评审时用）');
   eq(parseFlags([]).noExempt, false, '默认启用豁免');
+
+  // 22.6 护栏必须是**正向语义判定**，不是样例黑名单（修 1207-01 指出的问题）
+  //
+  // 旧护栏的病根：只拿每类**一个样例**去试正则，于是——
+  //   ^scripts/lib/            命中不了样例 autodispatch-watcher.mjs → 豁免了台账解析库
+  //   ^\.opencode/agents/expert/ 命中不了样例 router.md            → 豁免了 20 个专家定义
+  // 新护栏把每条模式在整棵文件树上展开，逐个判定「是否可证为机器生成」。下面用真实攻击模式验它堵不堵得住。
+  const GEN = '# 某视图（自动生成，勿手编辑）\n';
+  const REPO = [
+    'docs/expert-team/runbook/签批状态视图.md',
+    'docs/expert-team/runbook/度量看板.md',
+    'docs/expert-team/runbook/审批记录.md',
+    'docs/expert-team/runbook/派单日志.md',
+    'docs/expert-team/runbook/待签批清单.md',
+    'docs/expert-team/runbook/核对记录.md',
+    'scripts/autodispatch-watcher.mjs',
+    'scripts/lib/runbook.mjs',
+    '.github/workflows/expert-guardrails.yml',
+    '.opencode/agents/router.md',
+    '.opencode/agents/expert/01-product.md',
+    'raci/门禁阈值.csv',
+    '04-编排与门禁.md',
+  ];
+  const headOf = (p) => (p.includes('签批状态视图') || p.includes('度量看板') ? GEN : '# 普通手写文件\n');
+
+  // 合法白名单：只豁免两个派生视图
+  const good = await auditWhitelist('模式,理由\n^docs/expert-team/runbook/签批状态视图\\.md$,x\n^docs/expert-team/runbook/度量看板\\.md$,y\n', REPO, headOf);
+  eq(good.ok, true, '只豁免机器生成文件 → 通过');
+  eq(good.rules.map((r) => r.verdict), ['OK', 'OK'], '两条规则均 OK');
+
+  // 攻击 1：^scripts/lib/ —— 旧护栏漏掉的洞
+  const atk1 = await auditWhitelist('模式,理由\n^scripts/lib/,x\n', REPO, headOf);
+  eq(atk1.ok, false, '攻击 ^scripts/lib/ 被拦（旧护栏会放过）');
+  truthy(/台账解析库|门禁执行代码/.test(atk1.issues.map((i) => i.msg).join()), '拦截原因指明是门禁实现');
+  eq(atk1.rules[0].verdict, 'PROTECTED', '规则判为 PROTECTED');
+
+  // 攻击 2：^\.opencode/agents/expert/ —— 旧护栏漏掉的第二个洞
+  const atk2 = await auditWhitelist('模式,理由\n^\\.opencode/agents/expert/,x\n', REPO, headOf);
+  eq(atk2.ok, false, '攻击 ^\\.opencode/agents/expert/ 被拦（旧护栏会放过）');
+  eq(atk2.rules[0].verdict, 'PROTECTED', '规则判为 PROTECTED（专家定义不可豁免）');
+
+  // 攻击 3：宽泛模式 ^docs/ —— 会匹配到手写文档
+  const atk3 = await auditWhitelist('模式,理由\n^docs/,x\n', REPO, headOf);
+  eq(atk3.ok, false, '攻击 ^docs/ 被拦（会匹配手写文档）');
+  truthy(atk3.issues.some((i) => /审批记录|派单日志|待签批清单|核对记录/.test(i.msg)), '指名了被误豁免的审计链文件');
+
+  // 攻击 4：匹配到手写但不在硬规则内的文件 → 存疑即拒
+  const atk4 = await auditWhitelist('模式,理由\n^raci/,x\n', REPO, headOf);
+  eq(atk4.ok, false, '攻击 ^raci/ 被拦（门禁阈值 CSV 不可豁免）');
+  truthy(atk4.issues.some((i) => /存疑即拒|门禁阈值/.test(i.msg)), '给出存疑即拒或门禁阈值的理由');
+
+  // 攻击 5：死规则（匹配不到任何文件）
+  const atk5 = await auditWhitelist('模式,理由\n^no/such/path$,x\n', REPO, headOf);
+  eq(atk5.ok, false, '死规则被判 fail');
+  eq(atk5.rules[0].verdict, 'DEAD', '规则判为 DEAD');
+  truthy(/死规则/.test(atk5.issues[0].msg), '说明死规则易被误解为已豁免全部');
+
+  // 攻击 6：文件自称"自动生成"也不能豁免审计链（防自我声明绕过）
+  const lying = (p) => (p.includes('审批记录') ? GEN : headOf(p));
+  const atk6 = await auditWhitelist('模式,理由\n^docs/expert-team/runbook/审批记录\\.md$,x\n', REPO, lying);
+  eq(atk6.ok, false, '文件自称自动生成也无法豁免审计链（PROTECTED 优先于 GENERATED）');
+  eq(atk6.rules[0].verdict, 'PROTECTED', 'PROTECTED 判定优先');
+
+  // 边界
+  eq((await auditWhitelist('', REPO, headOf)).ok, false, '空表判 fail（易误读为全可豁免）');
+  eq((await auditWhitelist('模式,理由\n([unclosed,x\n', REPO, headOf)).ok, false, '坏正则判 fail');
+  eq((await auditWhitelist(null, REPO, headOf)).ok, false, 'null 表判 fail');
+  eq((await auditWhitelist('模式,理由\n^docs/x\\.md$,r\n', [], headOf)).rules[0].verdict, 'DEAD', '空文件树时判 DEAD');
+  // 异步 headOf 也必须正确 resolve（我第一版把 Promise 传给同步分类器，全判 UNKNOWN）
+  const atk7 = await auditWhitelist('模式,理由\n^docs/expert-team/runbook/签批状态视图\\.md$,x\n', REPO, async (p) => headOf(p));
+  eq(atk7.ok, true, '异步 headOf 被正确 await（回归：Promise 传给同步分类器会全判 UNKNOWN）');
+  // 非字符串 headOf 必须兜底为读不到，而不是崩或误判
+  const atk8 = await auditWhitelist('模式,理由\n^docs/expert-team/runbook/签批状态视图\\.md$,x\n', REPO, () => undefined);
+  eq(atk8.ok, false, 'headOf 返回非字符串 → 兜底判 fail（存疑即拒，不静默放行）');
+
+  // 真实仓库上的当前白名单必须通过
+  const realCsv = await readFile(join(ROOT, 'docs', 'expert-team', 'raci', '免评审白名单.csv'), 'utf8');
+  const realFiles = [];
+  // 按路径分段精确匹配，不能用前缀正则（`\.git` 前缀会吃掉 `.github/`）
+  const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'logs', 'free-model-test']);
+  const walk = async (rel) => {
+    let ents = [];
+    // 注意：这里的 catch 只应吞「目录不存在」。我第一版写成 `catch { return; }`，
+    // 结果把 **readdir 未导入** 抛的 ReferenceError 也一起吞了，函数静默返回空数组，
+    // 断言只看到「0 个文件」——**防御性 catch 掩盖了真错误，比没有 catch 更坏**。
+    // 故显式区分：只有 ENOENT 才静默，其余抛出让测试红。
+    try { ents = await readdir(join(ROOT, rel), { withFileTypes: true }); }
+    catch (e) { if (e && e.code === 'ENOENT') return; throw e; }
+    for (const e of ents) {
+      if (SKIP_DIRS.has(e.name)) continue;
+      const r2 = rel ? rel + '/' + e.name : e.name;
+      if (e.isDirectory()) await walk(r2); else realFiles.push(r2);   // 注意：叶子必须 push 回同一数组
+    }
+  };
+  await walk('');
+  truthy(realFiles.length > 50, `真实文件树收集成功（${realFiles.length} 个文件）`);
+  // 关键：护栏必须**看得见**这些目录，否则等于没保护。
+  // 我第一版用 /^(\.git|...)/ 前缀匹配，`.github/` 被 `\.git` 前缀吃掉整个跳过
+  // ——用来堵洞的护栏自己漏掉了 CI 流水线目录，正是它本该消除的那类盲区。
+  for (const must of ['.github/workflows/expert-guardrails.yml', 'scripts/autodispatch-watcher.mjs',
+    'scripts/lib/runbook.mjs', '.opencode/agents/router.md', 'docs/expert-team/runbook/审批记录.md',
+    'docs/expert-team/raci/门禁阈值.csv', 'docs/expert-team/04-编排与门禁.md']) {
+    truthy(realFiles.includes(must), `护栏视野内含受保护文件：${must}`);
+  }
+  truthy(!realFiles.some((p) => p.startsWith('node_modules/')), 'node_modules 已排除');
+  truthy(!realFiles.some((p) => p.startsWith('.git/')), '.git 已排除（且未误伤 .github）');
+  const realAudit = await auditWhitelist(realCsv, realFiles, async (p) => {
+    try { return (await readFile(join(ROOT, p), 'utf8')).slice(0, 400); } catch { return ''; }
+  });
+  eq(realAudit.ok, true, `真实白名单在 ${realFiles.length} 个文件上通过语义审计`);
+  truthy(realAudit.rules.every((r) => r.gen.length === r.matched.length), '每条规则所豁免文件全部为 GENERATED');
 }
 
 console.log('\n[23] fail-closed 门：失败轮次不得推进基线（①：曾出现「结论产出=false 但 lastHead 已推进」）');
