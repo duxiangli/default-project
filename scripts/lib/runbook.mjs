@@ -14,6 +14,7 @@ export const RUNBOOK_FILES = {
   dispatch: '派单日志.md',
   pending: '待签批清单.md',
   approval: '审批记录.md',
+  evidence: '证据索引.md',
   view: '签批状态视图.md',
   metrics: '度量看板.md',
 };

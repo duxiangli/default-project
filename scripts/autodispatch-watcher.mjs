@@ -467,6 +467,29 @@ async function ledgerDoctor(flags) {
   }
 }
 
+/**
+ * 派单后派生视图刷新：台账体检修完之后，把「签批状态视图」「度量看板」一并重生成。
+ *
+ * 2026-09-27 实测缺口：只体检台账而不刷新派生视图，导致每次派单后
+ * approval-sync --check 与 dispatch-metrics --check 必然失败（CI 红）——
+ * 派生物随台账变化，必须与台账同批更新，否则校验器判定的「漂移」其实是「没刷新」。
+ */
+async function refreshViews() {
+  const scripts = ['scripts/approval-sync.mjs', 'scripts/dispatch-metrics.mjs'];
+  const results = [];
+  for (const script of scripts) {
+    try {
+      const r = await runCli(process.execPath, [join(ROOT, script)], { cwd: ROOT, timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+      const first = (r.stdout || '').split(/\r?\n/).find((l) => l.includes('已刷新')) || '';
+      results.push({ script, ok: true, msg: first.trim() });
+    } catch (e) {
+      results.push({ script, ok: false, msg: String(e.message || e).slice(0, 120) });
+    }
+  }
+  for (const r of results) log(`  派生视图 ${r.ok ? '已刷新' : '刷新失败'}：${r.msg || r.script}`);
+  return { ok: results.every((r) => r.ok), results };
+}
+
 /** 通道健康检查：最小提示词探活。探不通就不派单，避免把服务楔死 */
 export async function healthCheck(cli, dir, { timeout = 90000 } = {}) {
   const t0 = Date.now();
@@ -547,11 +570,12 @@ async function poll(ctx) {
     try {
       const d = await dispatch(cli, dir, 'smoke', text, flags);
       const doc = await ledgerDoctor(flags);
+      const views = await refreshViews();
       const repo = state.repos[repoKey] || { dispatches: [] };
       repo.dispatches = [...(repo.dispatches || []), {
         at: cur, kind: 'mock', subject: sanitizeUntrusted(flags.mockMr),
         sessionId: d.sessionId, hashes: [], transport: d.transport, conclusion: d.conclusion,
-        ledgerCheck: doc.ok ? 'clean' : 'unrepaired',
+        ledgerCheck: doc.ok ? 'clean' : 'unrepaired', viewsOk: views.ok,
       }];
       repo.lastCheck = cur;
       state.repos[repoKey] = repo;
@@ -684,12 +708,13 @@ async function poll(ctx) {
   try {
     const d = await dispatch(cli, dir, plan.newestHash.slice(0, 8), text, flags);
     const doc = await ledgerDoctor(flags);   // ← 写完立刻自检+修复（router 自身无权跑命令）
+    const views = await refreshViews();
     const repo = state.repos[repoKey];
     repo.lastHead = plan.advanceToHash; // 只推进到本批最旧一条 → 无缺口
     repo.breaker = breakerUpdate(repo.breaker, { type: 'dispatch-ok' });
     repo.dispatches = [...(repo.dispatches || []), {
       at: cur, kind: 'git', sessionId: d.sessionId, transport: d.transport, conclusion: d.conclusion,
-      ledgerCheck: doc.ok ? 'clean' : 'unrepaired',
+      ledgerCheck: doc.ok ? 'clean' : 'unrepaired', viewsOk: views.ok,
       hashes: plan.take.map((c) => c.hash), advanceTo: plan.advanceToHash, overflow: plan.overflow,
       files: files.slice(0, MAX_FILES), summary: d.summary || '',
     }];

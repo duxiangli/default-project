@@ -149,6 +149,13 @@ for (const extra of ['lib', 'install-autostart.ps1']) {
   try { await cp(join(ROOT, 'scripts', extra), join(STAGE, 'scripts', extra), { recursive: true }); }
   catch { /* 该项不存在则跳过 */ }
 }
+// CI 流水线与 .gitignore 也必须进包：缺了它们，包内项目的门禁5/7 无法自动化校验。
+// 2026-09-27 由 expert/16-devops-sre 在真实派单评审（DSP-20260927-0040-01）中查出——
+// 与「漏 scripts/lib」同类的复发：导出清单是手写白名单，加了新东西却没同步。
+for (const extra of ['.github', '.gitignore']) {
+  try { await cp(join(ROOT, extra), join(STAGE, extra), { recursive: true }); }
+  catch { /* 该项不存在则跳过 */ }
+}
 await cp(join(ROOT, 'docs', '交付包-README.md'), join(STAGE, 'README.md'));
 
 const fileNames = [];

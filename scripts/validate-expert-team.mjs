@@ -389,6 +389,26 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
   }
   if (structIssues.length === 0) ok('台账结构：三表无空行断表、列数与收尾竖线一致、锚点在末行数据之后');
   else bad(`台账结构问题: ${structIssues.slice(0, 4).join('; ')}${structIssues.length > 4 ? ' …' : ''}`);
+
+  // 语义校验：台账医生能补「列数」但不知道缺的是哪一列，补错会造成语义错位（如把依据写进建议列）
+  const semIssues = [];
+  const apText = await rd(path.join(docDir, 'runbook/审批记录.md'));
+  for (const l of apText.split('\n')) {
+    if (!/^\| AP-/.test(l)) continue;
+    const c = l.split('|').slice(1, -1).map((x) => x.trim());
+    if (c.length !== 13) continue;
+    const id = c[0];
+    // 种子行（体系初始化记录）不是一次真实派单，R/建议列天然不适用，不套派单行格式
+    if (/初始化/.test(c[3] || '')) continue;
+    if (!/^(AP|DSP)-\d{8}-\d{4}(-\d{2})?$/.test(id)) semIssues.push(`${id}: 单号格式异常`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(c[1])) semIssues.push(`${id}: 审批日期非 YYYY-MM-DD（实为「${c[1]}」）`);
+    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(c[2])) semIssues.push(`${id}: 签批时间非「日期 时:分」（实为「${c[2]}」）`);
+    if (!/expert\/[a-z0-9-]+/.test(c[6])) semIssues.push(`${id}: R 列非 expert/xx（实为「${c[6]}」）`);
+    if (!/^(建议批准|批准|有条件|有条件批准|驳回|需人工)(\/|$)/.test(c[8])) semIssues.push(`${id}: 专家建议列非四态（实为「${String(c[8]).slice(0, 20)}」）`);
+    if (!/^(批准|有条件批准|驳回|需人工)$/.test(c[9])) semIssues.push(`${id}: 签批结论列非人类四态（实为「${String(c[9]).slice(0, 20)}」）`);
+  }
+  if (semIssues.length === 0) ok('台账语义：审批台账 13 列的单号/日期/时间/R/四态/结论均落在正确列');
+  else bad(`台账语义错位 ${semIssues.length} 处: ${semIssues.slice(0, 3).join('; ')}${semIssues.length > 3 ? ' …' : ''}`);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
