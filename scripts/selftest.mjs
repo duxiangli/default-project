@@ -16,7 +16,7 @@ import {
   parseFlags, sanitizeUntrusted, buildUntrustedBlock, planIncremental,
   REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
-  buildSerialNotice, runCli, splitExempt,
+  buildSerialNotice, runCli, splitExempt, countDispatchRows,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict } from './lib/runbook.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
@@ -616,6 +616,40 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
   // 22.5 参数开关
   eq(parseFlags(['--no-exempt']).noExempt, true, '--no-exempt 可临时关闭豁免（想强制全量评审时用）');
   eq(parseFlags([]).noExempt, false, '默认启用豁免');
+}
+
+console.log('\n[23] fail-closed 门：失败轮次不得推进基线（①：曾出现「结论产出=false 但 lastHead 已推进」）');
+{
+  // 23.1 台账行计数必须可靠——它是这道门的唯一判据
+  const n1 = await countDispatchRows();
+  eq(typeof n1 === 'number' && n1 > 0, true, `能数出派单日志现有行数（${n1}）`);
+  const n2 = await countDispatchRows();
+  eq(n2, n1, '重复调用结果稳定（不因读副作用漂移）');
+
+  const logMd = await readFile(join(ROOT, 'docs', 'expert-team', 'runbook', '派单日志.md'), 'utf8');
+  // 与 countDispatchRows 同一套回退逻辑：begin/end 锚点齐全才用锚点，否则退回全文
+  const hasBoth = logMd.includes('<!-- dispatch-log-begin -->') && logMd.includes('<!-- dispatch-log-end -->');
+  const seg = hasBoth
+    ? logMd.split('<!-- dispatch-log-begin -->')[1].split('<!-- dispatch-log-end -->')[0]
+    : logMd.split('<!-- dispatch-log-end -->')[0];
+  const real = seg.split(/\r?\n/).filter((l) => /^\| DSP-/.test(l.trim())).length;
+  eq(n1, real, '计数与实际行数一致（口径统一，不会数到表头/正文）');
+  truthy(/^\| DSP-/m.test(logMd), '派单日志确有数据行');
+
+  // 23.2 门本身必须在代码里，且两个条件都在
+  const src = await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8');
+  truthy(/if \(!d\.conclusion \|\| !traced\)/.test(src), '门条件为「无结论 或 未留痕」二者之一即拦');
+  truthy(/无结论产出/.test(src) && /台账未新增派单行/.test(src), '两种失败原因分别有独立措辞（便于归因）');
+  truthy(/基线不推进（fail-closed）/.test(src), '日志明写基线不推进');
+  truthy(/留待下轮重试/.test(src), '明写留待下轮重试（不静默丢弃）');
+  truthy(/failedDispatches/.test(src), '失败轮次进状态留痕（可事后审计，不是只打日志）');
+  truthy(/dispatch-fail/.test(src) && /fail-closed：/.test(src), '失败计入熔断并带原因');
+  // 关键：推进基度的赋值必须落在门之后
+  const gateAt = src.indexOf('if (!d.conclusion || !traced)');
+  const advAt = src.indexOf('repo.lastHead = plan.advanceToHash; // 只推进到本批最旧一条');
+  truthy(gateAt > 0 && advAt > gateAt, '推进基线的赋值在门之后（顺序反了门就白设）');
+  // 豁免路径也要推进基线，但它不经过这道门——确认它是独立分支且写明「豁免≠通过」
+  truthy(/豁免派单/.test(src) && /豁免≠通过/.test(src), '豁免路径独立且明写「豁免≠通过」');
 }
 
 

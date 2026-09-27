@@ -236,6 +236,20 @@ export function buildDotPathNotice(files) {
 }
 
 /**
+ * 派单日志现有数据行数（只认锚点内、以 `| DSP-` 开头的行）。
+ * 用于 fail-closed 门判断「这一轮 router 到底有没有真的留痕」——
+ * 纯机械计数，不解析语义，因此不会因结论措辞变化而误判。
+ */
+export async function countDispatchRows() {
+  try {
+    const md = await readFile(join(ROOT, 'docs', 'expert-team', 'runbook', '派单日志.md'), 'utf8');
+    const m = md.split('<!-- dispatch-log-begin -->')[1];
+    const seg = m ? m.split('<!-- dispatch-log-end -->')[0] : md;   // 无锚点则退回全文（兼容旧文件）
+    return seg.split(/\r?\n/).filter((l) => /^\| DSP-/.test(l.trim())).length;
+  } catch { return 0; }
+}
+
+/**
  * 免评审白名单（④衍生，2026-09-27）：纯派生文件改动不派单。
  *
  * 为什么只豁免「派生视图」而不豁免 scripts/ 或整个 runbook/——这是实测数据推出来的：
@@ -976,22 +990,61 @@ async function poll(ctx) {
   }
   log(`  通道探活通过（${h.ms}ms）`);
 
+  // 派单前的台账行数基线：用于事后判断「这一轮到底有没有真的留痕」
+  const rowsBefore = await countDispatchRows();
+
   try {
     const d = await dispatch(cli, dir, plan.newestHash.slice(0, 8), text, flags);
     const doc = await ledgerDoctor(flags);   // ← 写完立刻自检+修复（router 自身无权跑命令）
     const views = await refreshViews();
     const repo = state.repos[repoKey];
+    const rowsAfter = await countDispatchRows();
+    const traced = rowsAfter > rowsBefore;   // 台账是否新增了派单行
+
+    /* ── fail-closed 门：只有「有结论」且「台账真的留痕」才推进基线 ──
+     *
+     * 2026-09-27 实测的 fail-open（由 expert/16-devops-sre 在 DSP-20260927-1119-01 指出、
+     * 我用 logs/watcher.log 复现）：原逻辑只要 dispatch() 没抛异常就无条件
+     * `repo.lastHead = plan.advanceToHash`，于是——
+     *   [2026-09-27 02:58:11] poll done：派单 1 次（结论产出=false），lastHead→84c064c8
+     * 基线越过了**没评审成功**的提交，它们从此不再进入窗口 = 漏审。
+     * 那次没真漏审（84c064c 后来由 11:10 那轮补上），**但那是运气不是设计**。
+     *
+     * 两个条件缺一不可：
+     *   ① 结论产出 —— 模型没给出结论就等于没评审；
+     *   ② 台账留痕 —— router 声称做完但没写派单日志行，同样等于没留痕、无法审计。
+     * 只判 ① 会漏掉「有结论但没落盘」；只判 ② 会漏掉「写了行但结论是空的」。
+     */
+    if (!d.conclusion || !traced) {
+      const why = [!d.conclusion ? '无结论产出' : null, !traced ? '台账未新增派单行' : null].filter(Boolean).join(' 且 ');
+      repo.breaker = breakerUpdate(repo.breaker, { type: 'dispatch-fail', error: `fail-closed：${why}` });
+      repo.lastCheck = cur;
+      repo.failedDispatches = [...(repo.failedDispatches || []), {
+        at: cur, hashes: plan.take.map((c) => c.hash.slice(0, 8)), sessionId: d.sessionId,
+        conclusion: !!d.conclusion, traced, rowsBefore, rowsAfter,
+      }].slice(-30);
+      await saveState(state, flags);
+      log(`[!] **基线不推进（fail-closed）**：${why} —— 本批 ${plan.take.length} 条提交留待下轮重试`);
+      log(`    派单会话 ${d.sessionId || '(无)'}；台账行 ${rowsBefore} → ${rowsAfter}`);
+      if (!breakerAllows(repo.breaker)) {
+        log(`⛔ 已连续 ${repo.breaker.consecutiveFailures} 次失败 → 熔断，暂停派单；修复后用 --reset-breaker 复位`);
+      } else {
+        log(`    连续失败 ${repo.breaker.consecutiveFailures}/${BREAKER_DEFAULTS.threshold} 次`);
+      }
+      return { ...summary, ok: false, error: `fail-closed:${why}`, sessionId: d.sessionId, breaker: repo.breaker };
+    }
+
     repo.lastHead = plan.advanceToHash; // 只推进到本批最旧一条 → 无缺口
     repo.breaker = breakerUpdate(repo.breaker, { type: 'dispatch-ok' });
     repo.dispatches = [...(repo.dispatches || []), {
       at: cur, kind: 'git', sessionId: d.sessionId, transport: d.transport, conclusion: d.conclusion,
-      ledgerCheck: doc.ok ? 'clean' : 'unrepaired', viewsOk: views.ok,
+      ledgerCheck: doc.ok ? 'clean' : 'unrepaired', viewsOk: views.ok, tracedRows: rowsAfter - rowsBefore,
       hashes: plan.take.map((c) => c.hash), advanceTo: plan.advanceToHash, overflow: plan.overflow,
       files: files.slice(0, MAX_FILES), summary: d.summary || '',
     }];
     repo.lastCheck = cur;
     await saveState(state, flags);
-    log(`poll done：派单 1 次（transport=${d.transport}，结论产出=${d.conclusion}），lastHead→${plan.advanceToHash.slice(0, 8)}${plan.overflow ? `，下轮续派 ${plan.overflow} 条` : ''}`);
+    log(`poll done：派单 1 次（transport=${d.transport}，结论产出=${d.conclusion}，台账新增 ${rowsAfter - rowsBefore} 行），lastHead→${plan.advanceToHash.slice(0, 8)}${plan.overflow ? `，下轮续派 ${plan.overflow} 条` : ''}`);
     return { ...summary, dispatched: 1, sessionId: d.sessionId, conclusion: d.conclusion, overflow: plan.overflow, hashes: plan.take.map((c) => c.hash) };
   } catch (e) {
     const repo = state.repos[repoKey];
