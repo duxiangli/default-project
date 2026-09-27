@@ -16,7 +16,7 @@ import {
   parseFlags, sanitizeUntrusted, buildUntrustedBlock, planIncremental,
   REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
-  buildSerialNotice, runCli,
+  buildSerialNotice, runCli, splitExempt,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict } from './lib/runbook.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
@@ -509,7 +509,7 @@ console.log('\n[21] 派单停滞防护（④：一次专家推理打转让 watch
 {
   // 21.1 参数层：软超时与心跳可配且有合理默认
   const pf = parseFlags([]);
-  eq(pf.stallTimeout, 900000, '默认软超时 15 分钟（实测僵死 13 分钟零进展，原先只有 3600s 一档）');
+  eq(pf.stallTimeout, 1800000, '默认软超时 30 分钟（实测慢批次 40 分钟才收敛，15 分钟会误杀可成功的派单）');
   eq(pf.heartbeat, 60000, '默认心跳 60s');
   const pf2 = parseFlags(['--stall-timeout', '120', '--heartbeat', '10']);
   eq(pf2.stallTimeout, 120000, '--stall-timeout 换算为毫秒');
@@ -562,6 +562,60 @@ console.log('\n[21] 派单停滞防护（④：一次专家推理打转让 watch
   truthy(/65,660 reasoning tokens/.test(routerMd), 'router.md 给出实测数据');
   truthy(/只评审本次 diff 的\*\*增量\*\*/.test(routerMd), 'router.md 含自引用护栏');
   truthy(/必须一并转达收敛纪律/.test(routerMd), 'router.md 要求派单时转达纪律');
+}
+
+console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子必须被门禁守住）');
+{
+  const wlCsv = await readFile(join(ROOT, 'docs', 'expert-team', 'raci', '免评审白名单.csv'), 'utf8');
+
+  // 22.1 只豁免派生视图
+  const s1 = splitExempt([
+    'docs/expert-team/runbook/签批状态视图.md',
+    'docs/expert-team/runbook/度量看板.md',
+    'docs/expert-team/runbook/证据索引.md',
+  ], wlCsv);
+  eq(s1.exempt.length, 3, '三个派生视图全部豁免');
+  eq(s1.review.length, 0, '全豁免时不剩待评审文件');
+  eq(s1.ruleCount, 3, '解析出 3 条规则');
+
+  // 22.2 门禁本体与审计链一律不豁免（这是本组最要紧的断言）
+  const MUST_REVIEW = [
+    'scripts/autodispatch-watcher.mjs',
+    'scripts/selftest.mjs',
+    'scripts/validate-expert-team.mjs',
+    '.github/workflows/expert-guardrails.yml',
+    '.opencode/agents/router.md',
+    'docs/expert-team/runbook/审批记录.md',
+    'docs/expert-team/runbook/派单日志.md',
+    'docs/expert-team/runbook/待签批清单.md',
+    'docs/expert-team/runbook/核对记录.md',
+    'docs/expert-team/04-编排与门禁.md',
+  ];
+  for (const f of MUST_REVIEW) {
+    const r = splitExempt([f], wlCsv);
+    eq([f, r.exempt.length], [f, 0], `不得豁免：${f}`);
+  }
+
+  // 22.3 混合场景：命中部分仍须派单
+  const s2 = splitExempt(['docs/expert-team/runbook/签批状态视图.md', 'scripts/selftest.mjs'], wlCsv);
+  eq([s2.exempt.length, s2.review.length], [1, 1], '混合场景正确拆分（1 豁免 / 1 待评审）');
+
+  // 22.4 边界与鲁棒
+  eq(splitExempt([], wlCsv).exempt.length, 0, '空文件列表安全');
+  eq(splitExempt(undefined, wlCsv).review.length, 0, 'undefined 安全');
+  eq(splitExempt(['a.ts'], '').exempt.length, 0, '空规则表不豁免任何文件');
+  eq(splitExempt(['a.ts'], null).exempt.length, 0, 'null 规则表安全');
+  // 坏正则必须被跳过，不能让整批失败（与路径路由规则同策略）
+  const badWl = '路径模式,豁免理由\n([unclosed,x\n^a\\.md$,y';
+  const s3 = splitExempt(['a.md', 'b.ts'], badWl);
+  eq(s3.exempt.length, 1, '白名单含坏正则时仍能匹配其余规则（不整批失败）');
+  eq(s3.ruleCount, 1, '坏正则不计入规则数');
+  // BOM 容忍
+  eq(splitExempt(['docs/expert-team/runbook/签批状态视图.md'], '\uFEFF' + wlCsv).exempt.length, 1, '容忍 BOM');
+
+  // 22.5 参数开关
+  eq(parseFlags(['--no-exempt']).noExempt, true, '--no-exempt 可临时关闭豁免（想强制全量评审时用）');
+  eq(parseFlags([]).noExempt, false, '默认启用豁免');
 }
 
 

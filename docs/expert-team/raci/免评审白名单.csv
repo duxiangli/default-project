@@ -1,0 +1,4 @@
+路径模式,豁免理由,谁生成,豁免后如何保证正确
+^docs/expert-team/runbook/签批状态视图\.md$,纯派生视图不含人类判断,scripts/approval-sync.mjs,CI 跑 approval-sync --check，漂移即红
+^docs/expert-team/runbook/度量看板\.md$,纯派生统计不含人类判断,scripts/dispatch-metrics.mjs,CI 跑 dispatch-metrics，数字由台账重算
+^docs/expert-team/runbook/证据索引\.md$,按台账机械算出的提示词版本与输出哈希,scripts/evidence-index.mjs,CI 重算并比对覆盖率

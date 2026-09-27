@@ -361,6 +361,40 @@ if (approvalLogText && !/approval-ledger-begin/.test(approvalLogText)) assetIssu
 if (assetIssues.length === 0) ok(`自动化资产：${autoAssets.length} 个脚本就绪 + watcher 加固在位 + 视图/锚点齐备`);
 else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
 
+// 免评审白名单护栏：白名单是「减派单」的口子，必须防住它被用来豁免审计链与门禁本体。
+// 依据（2026-09-27 实测）：scripts/ 下每次改动都产生待签批（watcher/selftest/validate 各 2/2），
+// 而台账类文件各 1 次改动产生待签批 0 次——所以豁免 scripts/ 等于让门禁实现跳过评审。
+{
+  const WL = 'raci/免评审白名单.csv';
+  const FORBIDDEN = [
+    ['审批记录', '人类签批台账本身', 'docs/expert-team/runbook/审批记录.md'],
+    ['派单日志', '派单审计留痕', 'docs/expert-team/runbook/派单日志.md'],
+    ['待签批清单', '待签批队列', 'docs/expert-team/runbook/待签批清单.md'],
+    ['核对记录', '双方核对台账', 'docs/expert-team/runbook/核对记录.md'],
+    ['scripts/', '门禁执行代码', 'scripts/autodispatch-watcher.mjs'],
+    ['.github/workflows', 'CI 流水线', '.github/workflows/expert-guardrails.yml'],
+    ['.opencode/agents', 'Agent 协议定义', '.opencode/agents/router.md'],
+  ];
+  const wlIssues = [];
+  let wlRows = [];
+  try {
+    const wl = await rd(path.join(docDir, WL));
+    wlRows = wl.replace(/^\uFEFF/, '').trim().split(/\r?\n/).slice(1).filter((l) => l.trim());
+  } catch { wlIssues.push('缺 ' + WL); }
+  for (const l of wlRows) {
+    const pat = l.split(',')[0];
+    if (!pat) continue;
+    let re = null;
+    try { re = new RegExp(pat, 'i'); } catch { wlIssues.push('白名单正则写错无法编译: ' + pat); continue; }
+    for (const [label, why, sample] of FORBIDDEN) {
+      if (re.test(sample)) wlIssues.push('白名单不得豁免「' + why + '」: ' + pat + '（实测会匹配 ' + sample + '）');
+    }
+  }
+  if (!wlIssues.length && wlRows.length) ok('免评审白名单：' + wlRows.length + ' 条派生视图，且未豁免审计链/门禁本体');
+  else if (!wlIssues.length) ok('免评审白名单：未设豁免项（全部改动均需评审）');
+  else bad('免评审白名单问题: ' + wlIssues.slice(0, 3).join('; ') + (wlIssues.length > 3 ? ' …' : ''));
+}
+
 /* ── 15. 台账表格结构（空行断表 / 列数 / 收尾竖线 / 锚点位置） ── */
 {
   const structIssues = [];

@@ -45,8 +45,12 @@ const API_TIMEOUT_MS = Number(process.env.AUTODISPATCH_API_TIMEOUT || 120000);
 // 一次真实派单含多个专家子会话：实测单个冒烟事项约 20 分钟，12 提交/51 文件的批量评审更久。
 // 默认给到 60 分钟；超时只算本轮失败（不推进 lastHead），下轮重试。
 const DISPATCH_TIMEOUT_MS = Number(process.env.AUTODISPATCH_DISPATCH_TIMEOUT || 3600000);
-/** 软超时：无进展多少秒即判停滞并终止（2026-09-27 加：实测一次专家推理打转静默 25 分钟） */
-const STALL_TIMEOUT_MS = Number(process.env.AUTODISPATCH_STALL_TIMEOUT || 900000);
+/**
+ * 软超时：无进展多少秒即判停滞并终止。
+ * 2026-09-27 定为 30 分钟——依据是实测：commit 84c064c 那轮专家烧 131,196 reasoning
+ * tokens、约 40 分钟才成功收敛。故 15 分钟会误杀可成功的派单；60 分钟又回到静默不可观测。
+ */
+const STALL_TIMEOUT_MS = Number(process.env.AUTODISPATCH_STALL_TIMEOUT || 1800000);
 /** 派单等待期心跳间隔：让「还在跑」与「卡住了」在日志里可区分 */
 const HEARTBEAT_MS = Number(process.env.AUTODISPATCH_HEARTBEAT || 60000);
 const MAX_SUBJECT = 120;
@@ -67,7 +71,7 @@ export function parseFlags(argv) {
     once: false, dryRun: false, interval: 60, mockMr: null, projectDir: null, statePath: null,
     maxCommits: 8, resetBaseline: false, replayLast: false, json: false, warnings: [],
     transport: 'run', dispatchTimeout: DISPATCH_TIMEOUT_MS, healthOnly: false, resetBreaker: false,
-    stallTimeout: STALL_TIMEOUT_MS, heartbeat: HEARTBEAT_MS,
+    stallTimeout: STALL_TIMEOUT_MS, heartbeat: HEARTBEAT_MS, noExempt: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -98,6 +102,7 @@ export function parseFlags(argv) {
       case '--dispatch-timeout': { const n = Number(next()); if (Number.isFinite(n) && n > 0) f.dispatchTimeout = n * 1000; else f.warnings.push(`--dispatch-timeout 值非法: ${n}`); break; }
       case '--stall-timeout': { const n = Number(next()); if (Number.isFinite(n) && n > 0) f.stallTimeout = n * 1000; else f.warnings.push(`--stall-timeout 值非法: ${n}`); break; }
       case '--heartbeat': { const n = Number(next()); if (Number.isFinite(n) && n > 0) f.heartbeat = n * 1000; else f.warnings.push(`--heartbeat 值非法: ${n}`); break; }
+      case '--no-exempt': f.noExempt = true; break;   // 临时关闭免评审白名单（想强制全量评审时用）
       default: f.warnings.push(`未知参数 ${a}`);
     }
   }
@@ -228,6 +233,44 @@ export function buildDotPathNotice(files) {
     ].join('\n')
     : '';
   return { dotFiles: list, dirs, block };
+}
+
+/**
+ * 免评审白名单（④衍生，2026-09-27）：纯派生文件改动不派单。
+ *
+ * 为什么只豁免「派生视图」而不豁免 scripts/ 或整个 runbook/——这是实测数据推出来的：
+ *   scripts/autodispatch-watcher.mjs   改动 2 次 → 产生待签批 2 次
+ *   scripts/selftest.mjs                改动 2 次 → 产生待签批 2 次
+ *   scripts/validate-expert-team.mjs    改动 2 次 → 产生待签批 2 次
+ *   .opencode/agents/router.md          改动 2 次 → 产生待签批 2 次
+ *   审批记录/派单日志/待签批清单/核对记录/度量看板/证据索引  各 1 次 → 产生待签批 **0 次**
+ * 即：**噪音最高的是 scripts/（门禁的执行代码），而台账类文件本来就不产生噪音。**
+ * 豁免 scripts/ 等于让门禁实现跳过评审——那样我就能自己削弱所有门禁而无人审查。
+ * 真正零评审价值的是「机器生成、内容可由脚本重算」的派生视图。
+ *
+ * 两条护栏：
+ *   1. 白名单是**数据**（raci/免评审白名单.csv），不是代码里写死的路径；
+ *   2. validate 第 N 节强制校验白名单**不得包含**审批记录.md、派单日志.md、
+ *      待签批清单.md、scripts/、.github/workflows/ —— 这几类是审计链或门禁本体，
+ *      一旦被加进白名单即判 fail。
+ *
+ * 豁免**只减派单，不减留痕**：被豁免的批次仍会记入 watcher 日志与状态，
+ * 只写「豁免」不写「通过」，避免日后误读成"已评审无问题"。
+ *
+ * @param {string[]} files 本批变更文件
+ * @param {string} csv 免评审白名单内容（含表头）
+ */
+export function splitExempt(files, csv) {
+  const lines = String(csv || '').replace(/^\uFEFF/, '').trim().split(/\r?\n/).slice(1);
+  const rules = lines.map((l) => l.split(',')[0]).filter(Boolean).map((p) => {
+    try { return new RegExp(p, 'i'); } catch { return null; }   // 白名单自身写错就跳过，不让整批失败
+  }).filter(Boolean);
+  const exempt = [];
+  const review = [];
+  for (const f of files || []) {
+    (rules.some((re) => re.test(String(f))) ? exempt : review).push(f);
+  }
+  return { exempt, review, ruleCount: rules.length };
 }
 
 /**
@@ -686,9 +729,18 @@ async function dispatch(cli, dir, titleHead, text, flags = {}) {
   }
 
   const args = ['run', '--agent', 'router', '--title', `autodispatch ${titleHead}`, '--format', 'json', text];
-  // 软超时：默认 15 分钟无进展即杀。实测一次专家推理打转（84c064c8 那轮）
-  // 专家烧 65660 reasoning tokens 仍不收敛、13 分钟零进展；
-  // 原先只有 3600s 一档硬上限，这类僵死要等一小时，且期间 watcher **完全静默**。
+  // 软超时：默认 30 分钟无进展即杀。
+  //
+  // ⚠ 取舍说明（2026-09-27 实测后调整，勿当成纯收益）：
+  //   我一度以为是"僵死不收敛"，后来拿到会话数据发现**判断错了**——
+  //   那轮（commit 84c064c）的会话最终 `outcome=succeeded`，文档专家烧了
+  //   **131,196 reasoning tokens**、整轮约 **40 分钟**才收敛。
+  //   即故障形态是「极慢但最终成功」，不是「永不收敛」。
+  //   所以软超时是**拿"漏审一慢但有效的派单"换"快速失败可观测"**：
+  //     - 定得太短（如 15 分钟）→ 会杀掉本可成功的派单，属漏审；
+  //     - 定得太长 → 回到"静默一小时"，可观测性又没了。
+  //   取 30 分钟是折中：**宁可漏审也不静默**，因为静默失效无法察觉，漏审至少会留在日志与待签批队列里。
+  //   要评审慢批次就显式调大：--stall-timeout 3600（或 AUTODISPATCH_STALL_TIMEOUT）。
   const soft = Number(flags.stallTimeout || STALL_TIMEOUT_MS);
   const r = await runCli(cli, args, {
     cwd: dir, timeout, softTimeoutMs: soft, heartbeatMs: flags.heartbeat || HEARTBEAT_MS,
@@ -801,6 +853,31 @@ async function poll(ctx) {
 
   const plan = planIncremental(commits, flags.maxCommits);
   const files = await getChangedFiles(dir, plan.take.map((c) => c.hash));
+
+  // 免评审白名单：本批若**全部**是机器生成的派生视图，则不派单（④衍生，治签批 treadmill）
+  // 豁免只减派单、不减留痕：仍推进基线、仍记状态与日志，只写「豁免」不写「通过」。
+  if (!flags.noExempt) {
+    try {
+      const wl = await readFile(join(ROOT, 'docs', 'expert-team', 'raci', '免评审白名单.csv'), 'utf8');
+      const { exempt, review, ruleCount } = splitExempt(files, wl);
+      if (!review.length && exempt.length) {
+        const advance = { ...(state.repos[repoKey] || {}) };
+        advance.lastHead = plan.advanceToHash;
+        advance.lastCheck = cur;
+        advance.exempted = [...(advance.exempted || []), {
+          at: cur, commits: plan.take.map((c) => c.hash.slice(0, 8)), files: exempt.slice(0, 20), reason: 'all-changed-files-are-derived',
+        }].slice(-50);
+        state.repos[repoKey] = advance;
+        await saveState(state, flags);
+        log(`豁免派单：本批 ${exempt.length} 个文件全部命中免评审白名单（规则 ${ruleCount} 条）——**豁免≠通过**`);
+        for (const f of exempt.slice(0, 8)) log(`    · ${f}`);
+        return { ...summary, mode: 'exempt', exempted: exempt.length, hashes: plan.take.map((c) => c.hash) };
+      }
+      if (exempt.length) {
+        log(`免评审白名单命中 ${exempt.length}/${files.length} 个文件（仍派单，评审范围只看其余 ${review.length} 个）：${exempt.slice(0, 4).join(', ')}${exempt.length > 4 ? ' …' : ''}`);
+      }
+    } catch (e) { log(`[!] 免评审白名单读取失败（不豁免任何文件）: ${e.message}`); }
+  }
 
   // 确定性路由预判：脚本算好必派专家并注入提示词，避免 router 自己通读几十个文件
   let pre = null;
