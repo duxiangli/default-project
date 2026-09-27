@@ -413,6 +413,31 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
   if (semIssues.length === 0) ok('台账语义：审批台账 13 列的单号/日期/时间/R/四态/结论均落在正确列');
   else bad(`台账语义错位 ${semIssues.length} 处: ${semIssues.slice(0, 3).join('; ')}${semIssues.length > 3 ? ' …' : ''}`);
 
+  // (c-2) 派单时间戳不得偏离单号 HHMM 位（②）
+  //
+  // 背景（2026-09-27 实测）：派单号原由 router 自编，且它编的是**整点/十分**的号
+  // （0100、0110、0020…），并把台账「派单时间」列填成与之自洽的值——
+  // 于是「号 vs 时间列」这类自洽性检查完全查不出。真实偏差要拿 watcher 日志对才暴露：
+  // DSP-20260927-0110-01 台账写 01:10，watcher 日志记 02:32:11 派单，差 82 分钟。
+  // 现在派单号由脚本按真实时钟生成注入，故「号内 HHMM ≡ 时间列 HH:mm」必须成立。
+  //
+  // 注意本检查**只能证明内部自洽**，不能证明时间真实（真实性的唯一证据在 logs/watcher.log）。
+  // 所以这里刻意不把它写成"时间已核实"，避免给出超出证据强度的保证。
+  const tsIssues = [];
+  const dispText = await rd(path.join(docDir, 'runbook/派单日志.md'));
+  for (const l of dispText.split('\n')) {
+    if (!/^\| DSP-/.test(l)) continue;
+    const c = l.split('|').slice(1, -1).map((x) => x.trim());
+    const m = /^DSP-(\d{8})-(\d{2})(\d{2})/.exec(c[0] || '');
+    const t = /(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})/.exec(c[1] || '');
+    if (!m || !t) { tsIssues.push(`${c[0]}: 单号或时间列无法解析`); continue; }
+    const idHm = `${m[2]}:${m[3]}`;
+    if (idHm !== `${t[2]}:${t[3]}`) tsIssues.push(`${c[0]}: 号内 ${idHm} ≠ 时间列 ${t[2]}:${t[3]}`);
+    if (m[1] !== t[1].replace(/-/g, '')) tsIssues.push(`${c[0]}: 号内日期 ${m[1]} ≠ 时间列日期 ${t[1]}`);
+  }
+  if (tsIssues.length === 0) ok('派单时间戳：12 行派单的单号 HHMM/日期与时间列全部自洽（注：仅证自洽，真实性证据在 logs/watcher.log）');
+  else bad(`派单时间戳与单号不符 ${tsIssues.length} 处: ${tsIssues.slice(0, 4).join('; ')}${tsIssues.length > 4 ? ' …' : ''}`);
+
   // (c) 双方核对强制：每条需签批=Y 的派单都必须在「核对记录」有对应行，且不成立必须附可验证反证
   const CROSS_FILE = 'runbook/核对记录.md';
   const crossIssues = [];
