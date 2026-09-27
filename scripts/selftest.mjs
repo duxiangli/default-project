@@ -16,7 +16,7 @@ import {
   parseFlags, sanitizeUntrusted, buildUntrustedBlock, planIncremental,
   REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
-  buildSerialNotice, runCli, splitExempt, countDispatchRows,
+  buildSerialNotice, runCli, splitExempt, countDispatchRows, sourceFingerprint, EXIT_CODE_STALE,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict } from './lib/runbook.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
@@ -650,6 +650,56 @@ console.log('\n[23] fail-closed 门：失败轮次不得推进基线（①：曾
   truthy(gateAt > 0 && advAt > gateAt, '推进基线的赋值在门之后（顺序反了门就白设）');
   // 豁免路径也要推进基线，但它不经过这道门——确认它是独立分支且写明「豁免≠通过」
   truthy(/豁免派单/.test(src) && /豁免≠通过/.test(src), '豁免路径独立且明写「豁免≠通过」');
+}
+
+console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM 不热更新，曾差点误判「修改无效」）');
+{
+  // 24.1 指纹必须只覆盖派单执行路径，且稳定、可辨
+  const f1 = await sourceFingerprint(ROOT);
+  truthy(/^[0-9a-f]{16}$/.test(f1), `指纹格式为 16 位十六进制（实得 ${f1}）`);
+  eq(f1, await sourceFingerprint(ROOT), '同一份源码两次计算结果一致（稳定）');
+  eq(await sourceFingerprint(join(ROOT, 'no-such-dir')), '', '路径不存在时返回空串（不误判为漂移）');
+
+  // 24.2 漂移必须能被计划任务重启接住
+  eq(EXIT_CODE_STALE, 75, '漂移退出码为 75（非 0，配合计划任务 -RestartCount 自动重启）');
+  truthy(/-RestartCount 3/.test(await readFile(join(ROOT, 'scripts', 'install-autostart.ps1'), 'utf8')),
+    '自启脚本确实配了 -RestartCount（否则漂移退出后无人重启，等于把常驻搞死）');
+  truthy(/EXIT_CODE_STALE/.test(await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8')),
+    'watcher 引用了漂移退出码');
+  const w = await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8');
+  truthy(/检测到源码漂移/.test(w), '有明确的漂移告警文案');
+  truthy(/仍跑启动时载入的旧代码/.test(w), '告警点明「仍跑旧代码」这个真实后果');
+  truthy(/codeFingerprint/.test(w), '指纹落进状态（供 --once 判常驻是否跑旧代码）');
+  truthy(/if \(stopping \|\| flags\.once\) return;/.test(w), '--once 模式不因漂移退出（单次调用无常驻可重启）');
+  // 关键回归：轮询定时器绝不能被 unref，否则常驻进程会立刻退出
+  truthy(!/const timer = setInterval\(runOnce[\s\S]{0,200}?timer\.unref/.test(w), '轮询定时器未被 unref（unref 会让常驻立刻退出）');
+
+  // 24.3 三张台账的 begin/end 锚点必须齐全，且 begin 紧贴表头之前
+  const RUNBOOK = join(ROOT, 'docs', 'expert-team', 'runbook');
+  for (const [file, beg, end] of [
+    ['派单日志.md', 'dispatch-log', 'dispatch-log'],
+    ['待签批清单.md', 'pending-approval', 'pending-approval'],
+    ['审批记录.md', 'approval-ledger', 'approval-ledger'],
+  ]) {
+    const md = await readFile(join(RUNBOOK, file), 'utf8');
+    const hasB = md.includes(`<!-- ${beg}-begin -->`);
+    const hasE = md.includes(`<!-- ${end}-end -->`);
+    truthy(hasB && hasE, `${file} begin/end 锚点齐全（缺一个 parseAnchored 就退回回退路径）`);
+    if (hasB && hasE) {
+      const seg = md.split(`<!-- ${beg}-begin -->`)[1].split(`<!-- ${end}-end -->`)[0];
+      const ls = seg.split(/\r?\n/).filter((l) => l.trim().startsWith('|'));
+      truthy(/^\| --- \|/.test(ls[1] || ''), `${file} 锚点内首行是表头、第二行是分隔行（begin 位置正确）`);
+      truthy(ls.length > 2, `${file} 锚点内能读到数据行（${ls.length - 2} 行）`);
+    }
+  }
+  // 实际解析验证：必须真能读到行，而不是只满足文本形状
+  const { readRunbook, dispatchRecords, pendingRecords, approvalRecords } = await import('./lib/runbook.mjs');
+  const book = await readRunbook(ROOT);
+  eq(book.dispatchTable.headers.length, 9, '派单日志解析出 9 列表头');
+  eq(book.dispatchTable.rows.length, 16, '派单日志解析出 16 行数据');
+  eq(pendingRecords(book).length, 14, '待签批清单解析出 14 行');
+  eq(approvalRecords(book).length, 14, '审批台账解析出 14 行');
+  truthy(dispatchRecords(book).filter((d) => d.needSign === 'Y').length === 13, 'needSign=Y 解析为 13 条');
 }
 
 

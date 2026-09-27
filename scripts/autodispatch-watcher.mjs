@@ -34,6 +34,7 @@ import { promisify } from 'node:util';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { readFile, writeFile, readdir, rename, unlink } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const exec = promisify(execFile);
@@ -236,7 +237,36 @@ export function buildDotPathNotice(files) {
 }
 
 /**
- * 派单日志现有数据行数（只认锚点内、以 `| DSP-` 开头的行）。
+ * 源码指纹：ESM 在**进程启动时**载入模块，磁盘上后续改动不会热更新。
+ * 于是改了 watcher 源码不重启，常驻会一直用旧逻辑派单且**无任何提示**——
+ * 2026-09-27 我因此差点误判「修改无效」（当时常驻还在发 6 条执行要求的旧提示词）。
+ *
+ * 修法：指纹只覆盖**派单执行路径**上的模块（watcher 自身 + scripts/lib/），
+ * 改文档、改进其它无关脚本不会触发重启——否则改个 README 就重启一次是噪声。
+ *
+ * @returns {Promise<string>} sha256 前 16 位；读不到任何文件时返回 ''（不误判为漂移）
+ */
+export async function sourceFingerprint(root = ROOT) {
+  const files = [join(root, 'scripts', 'autodispatch-watcher.mjs')];
+  try {
+    for (const f of await readdir(join(root, 'scripts', 'lib'))) {
+      if (f.endsWith('.mjs')) files.push(join(root, 'scripts', 'lib', f));
+    }
+  } catch { /* lib 目录不存在时只算 watcher 自身 */ }
+  const h = createHash('sha256');
+  let n = 0;
+  for (const f of files.sort()) {
+    try { h.update(f.replace(/\\/g, '/').split('/').slice(-2).join('/')); h.update(await readFile(f)); n++; }
+    catch { /* 单个文件读不到就跳过，不让指纹计算失败 */ }
+  }
+  return n ? h.digest('hex').slice(0, 16) : '';
+}
+
+/** 源码漂移时给常驻进程用的退出码（非 0，配合计划任务 -RestartCount 自动重启） */
+export const EXIT_CODE_STALE = 75;
+
+/**
+ * 派单日志现有数据行数（只认锚点内、以 `| DSP-` 开头���行）。
  * 用于 fail-closed 门判断「这一轮 router 到底有没有真的留痕」——
  * 纯机械计数，不解析语义，因此不会因结论措辞变化而误判。
  */
@@ -1094,10 +1124,61 @@ async function main() {
   };
 
   await runOnce();
-  if (flags.once) { await release(); return; }
+  if (flags.once) {
+    // 单次模式不重启，但若状态里记的指纹与当前不一致，说明**常驻跑的是旧代码**——必须告警
+    try {
+      const st = await loadState(flags, { persist: false });
+      const cur0 = st.repos[repoKey];
+      const fpNow = await sourceFingerprint();
+      if (cur0 && cur0.codeFingerprint && fpNow && cur0.codeFingerprint !== fpNow) {
+        log(`[!] 源码已变更（${cur0.codeFingerprint} → ${fpNow}），**常驻进程仍在跑旧代码**，需重启常驻才生效`);
+      }
+    } catch { /* 读状态失败不影响单次结论 */ }
+    await release();
+    return;
+  }
 
-  const timer = setInterval(runOnce, flags.interval * 1000);
   let stopping = false;
+  const timer = setInterval(runOnce, flags.interval * 1000);
+  // 注意：不要 unref 轮询定时器——它是常驻进程存活的原因，unref 会让进程立刻退出。
+
+  /* ── 源码漂移自检：ESM 不热更新，改了源码不重启就一直跑旧逻辑 ──
+   *
+   * 2026-09-27 实测踩过：改了 autodispatch-watcher.mjs 后常驻毫无反应，
+   * 我从进程命令行 grep 新纪律关键词才发现它发的是旧提示词，差点误判「修改无效」。
+   *
+   * 处置：常驻模式下发现漂移就**以退出码 75 退出**，由计划任务的
+   * `-RestartCount 3 -RestartInterval 5min` 自动重启并加载新代码。
+   * 选这条而不是自己 spawn 替代身：进程树更浅、Windows 上更不容易出僵尸。
+   * `--once` 单次模式**不**退出（一次性调用没有常驻可重启），只告警。
+   */
+  const fp0 = await sourceFingerprint();
+  if (fp0) {
+    log(`源码指纹：${fp0}（覆盖 watcher + scripts/lib/；漂移即重启加载新代码）`);
+    // 记进状态，供 --once 模式比对（判「常驻是否跑旧代码」）
+    try {
+      const st0 = await loadState(flags, { persist: false });
+      const r0 = st0.repos[repoKey] || {};
+      r0.codeFingerprint = fp0;
+      st0.repos[repoKey] = r0;
+      await saveState(st0, flags);
+    } catch { /* 记指纹失败不阻断启动 */ }
+  }
+  const driftTimer = setInterval(async () => {
+    if (stopping || flags.once) return;
+    const fp = await sourceFingerprint();
+    if (!fp || fp === fp0) return;
+    stopping = true;
+    clearInterval(timer);
+    clearInterval(driftTimer);
+    log(`[!] **检测到源码漂移**（${fp0} → ${fp}）：本进程仍跑启动时载入的旧代码。`);
+    log(`    以退出码 ${EXIT_CODE_STALE} 退出，交由计划任务重启（已配 -RestartCount 3 / 5min）加载新代码。`);
+    log('    若连续重启仍失败，请查计划任务 LastTaskResult 与 logs/watcher.log。');
+    await release();
+    process.exit(EXIT_CODE_STALE);
+  }, Math.max(30000, Math.min(flags.interval, 300) * 1000));
+  driftTimer.unref?.();
+
   const stop = async (sig) => {
     if (stopping) return;
     stopping = true;
