@@ -17,6 +17,7 @@ import {
   REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
   buildSerialNotice, runCli, splitExempt, countDispatchRows, sourceFingerprint, EXIT_CODE_STALE, MAX_RESTART_DEPTH,
+  effectiveDepth, RESTART_CHAIN_RESET_MS,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict } from './lib/runbook.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
@@ -673,7 +674,11 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
   const w = await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8');
   truthy(/export function spawnRestart/.test(w), '存在自重启函数 spawnRestart');
   truthy(/detached: true/.test(w) && /child\.unref\(\)/.test(w), '子进程真正脱离父进程（detached + unref）');
-  truthy(/stdio: 'ignore'/.test(w), '子进程 stdio 设为 ignore（不占父进程管道）');
+  // stdio 必须 inherit：父进程由 cmd 以 `>> logs/watcher.log` 启动，继承后替代进程
+  // 继续写同一日志。若用 ignore，重启后新进程一行日志都不写 = 多了个无法审计的静默进程
+  truthy(/stdio: 'inherit'/.test(w), '子进程 stdio 继承句柄（替代进程必须继续写日志）');
+  truthy(!/stdio: 'ignore'/.test(w), '未使用 stdio:ignore（会让替代进程变静默、审计链断裂）');
+  truthy(/多出一个无法审计的静默进程/.test(w), '代码里记录了「静默进程」这个具体后果');
   truthy(/AUTODISPATCH_START_DELAY_MS/.test(w), '子进程带启动延迟（避开父进程仍持锁的竞态）');
   truthy(/AUTODISPATCH_RESTART_DEPTH/.test(w), '重启深度经环境变量传递');
   truthy(/超过上限/.test(w) && /MAX_RESTART_DEPTH/.test(w), '深度超限时拒绝启动（死循环兜底）');
@@ -709,6 +714,55 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
   // 反向断言：漂移逻辑不得又跑回首轮派单之后
   truthy(!/await runOnce\(\);[\s\S]*const fp0 = await sourceFingerprint/.test(m),
     '漂移逻辑没有跑回首轮派单之后（防止再次回退）');
+
+  // 24.5 冒烟测试：**真的把 watcher 跑起来**，看 stderr 有没有 ReferenceError
+  //
+  // 2026-09-27 实测踩过：我把漂移逻辑移到首轮 runOnce() 之前时，`let stopping` 落在块外，
+  // 定时器闭包读到未声明引用，第一次 tick 抛 `ReferenceError: stopping is not defined`
+  // 把进程打崩、watcher 静默停摆——**而上面所有断言全绿**，
+  // 因为它们只验了「位置顺序」与「文本里有没有这个词」，**没有一个验运行时有效性**。
+  // 这是断言方式的结构性缺陷：文本断言能证明代码「写了什么」，不能证明它「跑不跑得起来」。
+  const smoke = await new Promise((resolve) => {
+    const out = [];
+    const p = spawn(process.execPath, [join(ROOT, 'scripts', 'autodispatch-watcher.mjs'),
+      '--once', '--health', '--state', join(tmp, 'smoke-state.json')], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const cap = Date.now() + 45000;
+    p.stdout.on('data', (d) => out.push(String(d)));
+    p.stderr.on('data', (d) => out.push('STDERR:' + d));
+    const t = setInterval(() => { if (Date.now() > cap) { clearInterval(t); try { p.kill(); } catch { /* 已退出 */ } } }, 500);
+    p.on('close', () => { clearInterval(t); resolve(out.join('')); });
+  });
+  truthy(!/ReferenceError/.test(smoke), '冒烟：watcher 实际运行无 ReferenceError');
+  truthy(!/is not defined/.test(smoke), '冒烟：无「变量未定义」类错误');
+  // 漂移定时器要真能被创建成功：跑 --health --once 时不进入常驻分支，
+  // 故用「代码里 stopping 声明早于定时器」这条静态断言补位（两者一起才够）
+  const iStop = m.indexOf('let stopping = false');
+  const iDriftT = m.indexOf('const driftTimer = setInterval');
+  truthy(iStop > 0 && iDriftT > 0 && iStop < iDriftT, 'stopping 声明早于漂移定时器创建（闭包读它）');
+  truthy(m.slice(iDriftT, iDriftT + 400).includes('if (stopping'), '漂移定时器回调确实读 stopping（说明声明必须在前）');
+
+  // 24.6 重启深度必须按**时间窗**判定，不能按终身累计
+  //
+  // 实测踩过：初版只把深度用环境变量往下传，于是「一天正常改两次代码」会把深度
+  // 累加到上限，**此后任何漂移都拒绝重启、直接死掉**——守卫从「防循环」变成
+  // 「用两次就废掉的功能」。循环的本质是短时间内的密集重启，判定必须看速率。
+  const NOW = 1_000_000_000_000;
+  eq(effectiveDepth(0, 0, NOW), 0, '无链起点时深度为 0（手动启动）');
+  eq(effectiveDepth(1, NOW - 1000, NOW), 1, '链内 1 秒：深度保留');
+  eq(effectiveDepth(2, NOW - 60000, NOW), 2, '链内 1 分钟：深度保留（此时已达上限）');
+  eq(effectiveDepth(2, NOW - RESTART_CHAIN_RESET_MS - 1, NOW), 0, '超过冷却窗口：深度归零（关键回归）');
+  eq(effectiveDepth(5, NOW - RESTART_CHAIN_RESET_MS * 10, NOW), 0, '远早于上次重启：视为新链、归零');
+  eq(effectiveDepth(1, NOW - RESTART_CHAIN_RESET_MS + 5000, NOW), 1, '刚好在窗口内：仍保留深度');
+  eq(effectiveDepth(3, undefined, NOW), 0, '链起点缺失时按新链处理（保守：归零而非卡死）');
+  truthy(RESTART_CHAIN_RESET_MS >= 10 * 60000, '冷却窗口至少 10 分钟（短于它会把正常编辑当循环）');
+  truthy(/AUTODISPATCH_RESTART_CHAIN_AT/.test(w), '链起点经环境变量传给子进程');
+  // 只在**代码行**里查措辞（注释里保留旧措辞作说明是合理的，误伤会逼人删文档）
+  const codeLines = w.split(/\r?\n/).filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l));
+  truthy(codeLines.some((l) => /短时间内已自重启/.test(l)), '拒重启的措辞点明「短时间内」（速率语义，不是终身次数）');
+  // 关键：守卫必须用**时间窗算出的**深度，而不是环境变量里的原始累计值
+  truthy(/const restartDepth = effectiveDepth\(rawDepth, chainAt\)/.test(w), '守卫用 effectiveDepth() 算出的深度');
+  truthy(/if \(restartDepth >= MAX_RESTART_DEPTH\)/.test(w), '深度守卫比较的是换算后的值');
+  truthy(!/if \(rawDepth >= MAX_RESTART_DEPTH\)/.test(w), '没有直接拿原始累计值做判断（那会让功能用两次就废）');
 
   // 24.3 三张台账的 begin/end 锚点必须齐全，且 begin 紧贴表头之前
   const RUNBOOK = join(ROOT, 'docs', 'expert-team', 'runbook');

@@ -265,8 +265,24 @@ export async function sourceFingerprint(root = ROOT) {
 /** 源码漂移时给常驻进程用的退出码（非 0） */
 export const EXIT_CODE_STALE = 75;
 
-/** 自重启深度上限：超过就不重启，避免「改了代码→重启→又检出漂移→再重启」的死循环 */
+/**
+ * 自重启深度上限：超过就不重启，避免「改了代码→重启→又检出漂移→再重启」的死循环。
+ *
+ * ⚠ 深度必须**按时间窗重置**，不能按终身累计（2026-09-27 实测踩过）：
+ *   初版只把 `RESTART_DEPTH` 用环境变量往下传，于是「一天改了两次代码」这种完全正常的
+ *   操作会把深度累加到上限，**此后任何一次漂移都拒绝重启、直接死掉**——
+ *   守卫从"防循环"变成了"用两次就废掉的功能"。
+ *   循环的本质是**短时间内的密集重启**，所以判定要看速率：
+ *   超过 `RESTART_CHAIN_RESET_MS` 仍未再次漂移，就认为上一轮已结束、深度归零。
+ */
 export const MAX_RESTART_DEPTH = 2;
+export const RESTART_CHAIN_RESET_MS = 30 * 60 * 1000;
+
+/** 依据重启链起始时刻算当前有效深度：链已「冷却」超过窗口则视为新链、深度归零 */
+export function effectiveDepth(depth, chainAt, now = Date.now()) {
+  if (!chainAt || now - chainAt > RESTART_CHAIN_RESET_MS) return 0;
+  return depth;
+}
 
 /**
  * 漂移后自重启：spawn 一个脱离的替代进程，然后自己退出。
@@ -284,16 +300,23 @@ export const MAX_RESTART_DEPTH = 2;
  * 子进程带 `AUTODISPATCH_START_DELAY_MS`：父进程先释放锁再退出，子进程延迟启动，
  * 避开「父还持锁、子抢不到锁」的竞态。
  */
-export function spawnRestart(depth) {
+export function spawnRestart(depth, chainAt) {
   const args = process.argv.slice(1);
   const child = spawn(process.execPath, args, {
     detached: true,
-    stdio: 'ignore',
+    // stdio 必须 'inherit' 而**不是** 'ignore'：父进程由 run-watcher.cmd 以
+    // `>> logs/watcher.log 2>> logs/watcher.err.log` 启动，继承句柄后替代进程
+    // 会继续写同一个日志。若用 'ignore'，重启后新进程**一行日志都不写**——
+    // 表现为「日志突然安静、但有个进程在跑」，即多出一个无法审计的静默进程。
+    // 这正是本机制要防的那类「看似正常、实则不可观测」。
+    stdio: 'inherit',
     windowsHide: true,
     env: {
       ...process.env,
       AUTODISPATCH_START_DELAY_MS: '3000',
       AUTODISPATCH_RESTART_DEPTH: String(depth + 1),
+      // 传重启链起始时刻，供子进程按时间窗判定「这是新链还是同一链」
+      AUTODISPATCH_RESTART_CHAIN_AT: String(chainAt || Date.now()),
     },
   });
   child.unref();
@@ -1129,8 +1152,15 @@ async function main() {
   for (const w of flags.warnings) log(`[warn] ${w}`);
 
   // 自重启子进程：启动延迟（避开父进程仍持锁的竞态）+ 深度守卫（防无限重启）
-  const restartDepth = Number(process.env.AUTODISPATCH_RESTART_DEPTH || 0);
+  // 深度按**时间窗**判定：链起点超过 RESTART_CHAIN_RESET_MS 即视为新链、深度归零，
+  // 否则「一天正常改两次代码」就会把功能用废（实测踩过，见 effectiveDepth 注释）。
+  const rawDepth = Number(process.env.AUTODISPATCH_RESTART_DEPTH || 0);
+  const chainAt = Number(process.env.AUTODISPATCH_RESTART_CHAIN_AT || 0);
+  const restartDepth = effectiveDepth(rawDepth, chainAt);
   const startDelay = Number(process.env.AUTODISPATCH_START_DELAY_MS || 0);
+  if (rawDepth > 0 && restartDepth === 0) {
+    log(`重启链已冷却超过 ${Math.round(RESTART_CHAIN_RESET_MS / 60000)} 分钟，深度归零（原深度 ${rawDepth}）`);
+  }
   if (restartDepth > MAX_RESTART_DEPTH) {
     console.error(`自重启深度 ${restartDepth} 超过上限 ${MAX_RESTART_DEPTH}，拒绝启动。`
       + '这通常意味着源码在持续变动，请人工确认后再手动启动常驻。');
@@ -1179,10 +1209,13 @@ async function main() {
    * 处置：常驻模式下发现漂移即**自 spawn 一个脱离的替代进程**并退出（不依赖计划任务的
    * -RestartCount——实测那条路径 7 分钟内毫无反应，见 spawnRestart 的注释）。
    * `--once` 单次模式不退出（无常驻可重启），只告警。
-   * `-RestartCount 3 -RestartInterval 5min` 自动重启并加载新代码。
-   * 选这条而不是自己 spawn 替代身：进程树更浅、Windows 上更不容易出僵尸。
-   * `--once` 单次模式**不**退出（一次性调用没有常驻可重启），只告警。
    */
+  // ⚠ `stopping` 必须声明在漂移定时器**之前**：定时器闭包会读它。
+  //   2026-09-27 实测踩过——我把漂移逻辑移到首轮 runOnce() 之前时，
+  //   `let stopping` 落在块外成了未声明引用，定时器第一次 tick 就抛
+  //   `ReferenceError: stopping is not defined` 把进程打崩，**而 selftest 全绿**
+  //   （它只断言了位置顺序、没验运行时有效性）。stderr 里静悄悄，watcher 直接停摆。
+  let stopping = false;
   const fp0 = await sourceFingerprint();
   if (fp0) {
     log(`源码指纹：${fp0}（覆盖 watcher + scripts/lib/；漂移即重启加载新代码）`);
@@ -1204,12 +1237,12 @@ async function main() {
     clearInterval(driftTimer);
     log(`[!] **检测到源码漂移**（${fp0} → ${fp}）：本进程仍跑启动时载入的旧代码。`);
     if (restartDepth >= MAX_RESTART_DEPTH) {
-      log(`⚠ 已自重启 ${restartDepth} 次仍检出漂移，**不再重启**（防死循环）。请人工确认代码是否在持续变动，然后手动重启常驻。`);
+      log(`⚠ 短时间内已自重启 ${restartDepth} 次仍检出漂移，**不再重启**（防死循环）。请人工确认代码是否在持续变动，然后手动重启常驻。`);
       await release();
       process.exit(EXIT_CODE_STALE);
     }
     await release();                       // 先放锁，子进程才抢得到
-    const pid = spawnRestart(restartDepth);
+    const pid = spawnRestart(restartDepth, chainAt || Date.now());
     log(`    已自重启：新进程 pid=${pid}（深度 ${restartDepth + 1}/${MAX_RESTART_DEPTH}，延迟 3s 启动以避开锁竞态），本进程以 ${EXIT_CODE_STALE} 退出。`);
     log('    注：不依赖计划任务的 -RestartCount——实测那条路径 7 分钟内无任何反应。');
     process.exit(EXIT_CODE_STALE);
@@ -1250,4 +1283,6 @@ async function main() {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => { console.error(e.message || e); process.exit(1); });
 }
+
+
 
