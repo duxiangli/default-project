@@ -102,6 +102,25 @@ export function classifyVerdict(cell) {
 
 export const daysSince = (iso) => (iso ? Math.floor((Date.now() - new Date(iso.replace(' ', 'T')).getTime()) / 86400000) : null);
 
+/**
+ * 「这一格**就是**占位符」——不是「这一格**提到**占位符」。
+ *
+ * ⚠ 这个区分是实测逼出来的。第一版用 /待填|TODO|TBD|待补/ 扫全文，
+ *   在**既有**的核对记录上误报了两行：
+ *     DSP-20260927-1222-01 处置列：「② 文档同步**待补**」
+ *     DSP-20260927-0020-01 专家结论列：「新增待补录04§4.3」
+ *   两者都是正常中文。若照第一版写，门禁会对**正确的内容**报红。
+ *   ——这是本体系第 4 次栽在「关键词匹配被『只是提到』骗到」上，故必须整格精确匹配。
+ *
+ * 放在这里而不是各自内联：`crosscheck-seed`（插骨架）、`validate`（拦骨架）、
+ * `selftest`（钉行为）三方都要用，**内联两份必然漂移**——而漂移出来的两份里
+ * 有一份宽松，就等于那道门形同虚设。
+ */
+export function isBarePlaceholder(cell) {
+  const bare = String(cell || '').replace(/[*\s]/g, '');
+  return /^[（(【[]?(待填|待补|待复核|待确认|TODO|TBD)[)）】\]]?$/.test(bare);
+}
+
 export async function readRunbook(root) {
   const dir = join(root, 'docs', 'expert-team', 'runbook');
   const out = {};

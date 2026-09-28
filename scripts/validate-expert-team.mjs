@@ -6,6 +6,8 @@
 import { readdir, readFile as rawReadFile } from 'node:fs/promises';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { auditHangRows } from './lib/crosscheck-hang.mjs';
+import { auditApprovalBasis, viewGeneratedAt, VIEW_FILES } from './lib/approval-basis-audit.mjs';
+import { isBarePlaceholder } from './lib/runbook.mjs';
 import { judgeHeartbeat, resolveThreshold, VERDICT } from './lib/watchdog.mjs';
 import { execFileSync } from 'node:child_process';
 
@@ -618,6 +620,25 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
       }
       if (!c[2] || /^\s*$/.test(c[2])) crossIssues.push(`${c[0]}: 缺专家原始结论（不得只留复核结论）`);
       if (!c[3] || /^\s*$/.test(c[3])) crossIssues.push(`${c[0]}: 缺复核方式（须写清核了什么）`);
+      // 显式堵住「播种空行」：`scripts/crosscheck-seed.mjs` 会为缺行的派单插入带「（待填）」的骨架，
+      // 免得手抄单号/原文时出错。**骨架不是核对记录**——它必须被门禁挡住，否则挂账纪律
+      // 会被一行空壳绕过。原先它只是**顺带**被上面的「复核结论取值」拦下，
+      // 那种隐式依赖太脆：改一下取值枚举，空行就能混进来。
+      //
+      // ⚠ 判据必须判「**这一格就是**占位符」，不能判「**这一格提到**占位符」。
+      //   我第一版写 /待填|TODO|TBD|待补/，结果在**既有行**上误报：
+      //     DSP-20260927-1222-01 的处置列写着「② 文档同步**待补**」、
+      //     DSP-20260927-0020-01 写着「新增待补录」——都是正常中文，不是占位符。
+      //   这是本体系第 4 次栽在「关键词匹配被『只是提到』骗到」上。
+      //   判定实现在 lib/runbook.mjs 的 isBarePlaceholder —— **不在这里内联**：
+      //   本文件、`crosscheck-seed`、`selftest` 三方共用一份正则；两份只要有一份更宽松，
+      //   这道门就形同虚设。
+      for (let ci = 0; ci < c.length; ci++) {
+        if (isBarePlaceholder(c[ci])) {
+          crossIssues.push(`${c[0]}: 第 ${ci + 1} 列整格只是占位符「${String(c[ci]).slice(0, 12)}」`
+            + '（`crosscheck-seed.mjs` 插入的骨架不算核对记录，须补齐复核方式/结论/反证/处置）');
+        }
+      }
     }
     if (crossIssues.length === 0) ok(`双方核对：${needCross.length} 条需签批派单全部有核对记录，复核结论取值受控、不成立均附反证`);
     else bad(`双方核对问题: ${crossIssues.slice(0, 4).join('; ')}${crossIssues.length > 4 ? ' …' : ''}`);
@@ -652,6 +673,78 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
   }
 }
 
+
+/* 18. 签批依据与台账现状的自相矛盾（2026-09-28）
+ *
+ * 起因：expert/20-docs 在 DSP-20260928-1530-01 抓出，AP-20260928-1228-01 的决策依据写着
+ *   「已重跑 approval-sync / dispatch-metrics 刷新。**条件既已满足，故落批准**」
+ * 而那两个脚本**根本不写待签批清单的状态列**，该行状态当时仍是「待签批」——条件并未满足。
+ *   这是本体系第一次出现**写在人类签批台账上的不成立陈述**，且当时无人发现。
+ *
+ * ⚠ 本节的能力边界（不得在任何文档里夸大）：
+ *   它查的是**机械可判定的矛盾**（断言 X 而台账证明非 X），**不是**核实依据为真。
+ *   依据里绝大多数内容是无法机械验证的推理，那仍然只能靠人或专家评审。
+ *   绿灯的含义是「**未发现矛盾**」，仅此而已；不得写成「审批依据已自动核实」。
+ *
+ * ⚠ 它**防再犯，不证过去**：1228-01 的状态列今天已回填，所以直接跑真实数据必然 0 命中。
+ *   反向测试必须**把历史状态模拟回去**才能证明它当初抓得到（见 scripts/selftest.mjs）。
+ */
+{
+  const [apTxt, qTxt] = await Promise.all([
+    (async () => { try { return await rawReadFile(path.join(docDir, 'runbook', '审批记录.md'), 'utf8'); } catch { return null; } })(),
+    (async () => { try { return await rawReadFile(path.join(docDir, 'runbook', '待签批清单.md'), 'utf8'); } catch { return null; } })(),
+  ]);
+  if (apTxt === null || qTxt === null) {
+    bad('读不到审批记录.md 或 待签批清单.md（依据矛盾检查无从进行）');
+  } else {
+    const cellOf = (l) => l.split('|').slice(1, -1).map((x) => x.trim());
+    const apRows = apTxt.split(/\r?\n/).filter((l) => l.startsWith('| AP-')).map(cellOf);
+    const qRows = qTxt.split(/\r?\n/).filter((l) => l.startsWith('| AP-')).map(cellOf);
+    const qHead = qTxt.split(/\r?\n/).find((l) => l.startsWith('| 审批单号') && l.indexOf('状态') >= 0);
+    const iQ = qHead ? cellOf(qHead).findIndex((h) => h.indexOf('状态') >= 0) : -1;
+    if (iQ < 0) bad('待签批清单表头里找不到「状态」列（依据矛盾检查无从进行）');
+    const queueStatus = new Map(iQ >= 0 ? qRows.map((r) => [r[0], r[iQ] || '']) : []);
+
+    // 键用**文件名**而非视图别名：`签批状态视图` 与 `状态视图` 是同一个文件的两个别名，
+    // 按别名建键会让同一次过期被数成两条违规，计数虚高一倍。
+    const viewDays = new Map();
+    for (const file of VIEW_FILES) {
+      let md = null;
+      try { md = await rawReadFile(path.join(docDir, 'runbook', file), 'utf8'); } catch { md = null; }
+      const d = md ? viewGeneratedAt(md) : null;
+      if (d) viewDays.set(file, d);
+    }
+
+    // ⚠ 索引**按位置**取（审批记录列序：0单号 1日期 2签批时间 … 9结论 10依据 11会签 12证据），
+    //   但**必须先自证表头列序**，否则改过列序就会静默读错列——本轮已因索引读错邻列
+    //   得出过「0 处异常」这种假零。
+    const apHead = apTxt.split(/\r?\n/).find((l) => l.startsWith('| 审批单号') && l.indexOf('决策依据') >= 0);
+    const ah = apHead ? cellOf(apHead) : null;
+    const iAp = ah ? ah.findIndex((h) => h.indexOf('审批单号') >= 0) : -1;
+    const iSign = ah ? ah.findIndex((h) => h.indexOf('签批时间') >= 0) : -1;
+    const iBasis = ah ? ah.findIndex((h) => h.indexOf('决策依据') >= 0) : -1;
+    if (iAp < 0 || iSign < 0 || iBasis < 0) {
+      bad('审批记录表头缺列（审批单号=' + iAp + ' 签批时间=' + iSign + ' 决策依据=' + iBasis + '），依据矛盾检查无从进行');
+    } else {
+      const approvals = apRows.map((r) => ({
+        ap: r[iAp] || '', basis: r[iBasis] || '', signDay: String(r[iSign] || '').slice(0, 10),
+      }));
+      const audit = auditApprovalBasis({ approvals, queueStatus, viewDays });
+      // **自证**：一行都没读到时，「0 处矛盾」是不可信的，直接红。
+      if (audit.inspected <= 0 || audit.clausesScanned <= 0) {
+        bad('签批依据矛盾检查：**一行/一子句都没读到**（inspected=' + audit.inspected
+          + ' clauses=' + audit.clausesScanned + '），本节结论不可信');
+      } else if (audit.violations.length === 0) {
+        ok('签批依据与台账现状：' + audit.inspected + ' 行 / ' + audit.clausesScanned
+          + ' 子句中未发现自相矛盾（**仅代表未发现矛盾，不代表依据已被核实**）');
+      } else {
+        bad('签批依据与台账现状有 ' + audit.violations.length + ' 处自相矛盾：'
+          + audit.violations.slice(0, 3).map((v) => v.ap + '[' + v.rule + '] ' + v.detail).join('；')
+          + (audit.violations.length > 3 ? ' …' : ''));
+      }
+    }
+  }
+}
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

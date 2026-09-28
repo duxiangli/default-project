@@ -19,9 +19,11 @@ import {
   buildSerialNotice, runCli, splitExempt, countDispatchRows, sourceFingerprint, EXIT_CODE_STALE, MAX_RESTART_DEPTH,
   effectiveDepth, RESTART_CHAIN_RESET_MS, driftIntervalMs,
 } from './autodispatch-watcher.mjs';
-import { classifyVerdict, parseSerial } from './lib/runbook.mjs';
+import { classifyVerdict, parseSerial, isBarePlaceholder } from './lib/runbook.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
+import { auditApprovalBasis, splitClauses, viewGeneratedAt, daysStale, PRODUCERS } from './lib/approval-basis-audit.mjs';
+import { planPendingStatus, applyPendingStatus, statusTextFor } from './lib/pending-status.mjs';
 import { judgeDispatchConclusion, extractConclusionBlocks } from './lib/dispatch-conclusion.mjs';
 import { partitionBlocks, missingFields, isRealConclusion, placeholderFieldCount } from './lib/conclusion-audit.mjs';
 import { auditHangRows, openHangClauses, contradictoryClauses, DISP_COL } from './lib/crosscheck-hang.mjs';
@@ -962,6 +964,174 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
 
     eq(extractConclusionBlocks('a<!--结论x-->b<!--结论y-->').length, 2, '能从一段文本里抽出多个结论块');
     eq(extractConclusionBlocks('没有标记').length, 0, '无标记返回 0 个');
+
+    /* blocks / real 两个计数也必须钉住（DSP-20260928-1658-01 C/expert/14-qa-governance 建议）
+     *
+     * 为什么要钉：这两个数是**线上定位问题的唯一线索**——
+     *   blocks=0 → 专家压根没出块（没真正派单 / 契约没被遵守）
+     *   blocks>0 且 real=0 → 出了块但不合规（缺字段 / 值还是占位符）
+     * 只断言 ok 的话，这两种失败在日志里长得一模一样，排查就得靠猜。
+     * 另外要钉住**真块与模板混杂时 real 恰好为 1**——若 real>1 说明
+     * 判定被放宽了，正是本轮修掉的那个漏洞（模板被当结论）的回归信号。
+     */
+    eq(judgeDispatchConclusion([REAL]).blocks, 1, '单块时 blocks=1');
+    eq(judgeDispatchConclusion([REAL]).real, 1, '单块且合规时 real=1');
+    eq(judgeDispatchConclusion([]).blocks, 0, '无产出时 blocks=0');
+    eq(judgeDispatchConclusion([]).real, 0, '无产出时 real=0');
+    eq(judgeDispatchConclusion([TPL]).blocks, 1, '只有模板时 blocks=1（有块但不实）');
+    eq(judgeDispatchConclusion([TPL]).real, 0, '只有模板时 real=0 —— **这正是修掉的漏洞，不得回归**');
+    eq(judgeDispatchConclusion([ECHO]).blocks, 1, '回抄未填时 blocks=1');
+    eq(judgeDispatchConclusion([ECHO]).real, 0, '回抄未填时 real=0');
+    const mixed = judgeDispatchConclusion([TPL, REAL]);
+    eq([mixed.blocks, mixed.real], [2, 1], '模板+真块混杂：blocks=2 而 real=**恰好 1**（>1 即为判定被放宽的回归）');
+    // DASH 是合法取值（「严重度: —」），必须计入 real —— 它不是占位符
+    eq([judgeDispatchConclusion([DASH]).blocks, judgeDispatchConclusion([DASH]).real], [1, 1],
+      '「严重度: —」计入 real（破折号不是占位符）');
+  }
+  // 22.12 待签批清单状态列派生（approval-sync 新增的第三个写目标）
+  //
+  // 这一列以前**纯靠人工回填**，而 approval-sync 只读它、写目标只有视图。
+  // 代价实测过两次：AP-20260928-1228-01 的决策依据写「已重跑 approval-sync 刷新，
+  // **条件既已满足**」——而那脚本根本不写这一列；以及每次签批都多一道纯抄写的人工步骤。
+  //
+  // 本组断言的主体是**反向测试**：把每个守卫都故意触发一次，确认它真的抛错。
+  // 只测 happy path 然后拿「全绿」当证据，是本体系反复栽过的跟头。
+  {
+    const H12 = ['审批单号(预生成)', '关联派单号', '事项摘要', '人类A', '建议四态', 'R/C', '高风险面', '状态', '备注'];
+    const mkRow12 = (ap, st) => `| ${ap} | DSP-20260928-0001-01 | 事项 | 人类A | 建议批准 | R=expert/16 | — | ${st} | — |`;
+    const doc12 = (...rows) => ['# 待签批清单', '<!-- pending-approval-begin -->',
+      `| ${H12.join(' | ')} |`, '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+      ...rows, '<!-- pending-approval-end -->', ''].join('\n');
+    const T12 = (rows) => ({ headers: H12, rows });
+    const AP12 = new Map([['AP-20260928-0001-01', { rawConclusion: '批准', date: '2026-09-28', dspId: 'DSP-20260928-0001-01' }]]);
+    const toWant = { ap: 'AP-20260928-0001-01', from: '待签批', to: '已签批·批准（2026-09-28）' };
+    const throws = (name, fn, mustMention) => {
+      let err = null;
+      try { fn(); } catch (e) { err = e; }
+      if (!err) { truthy(false, name + ' —— 应当抛错却没抛（守卫是假的）'); return; }
+      const msg = String(err.message || err);
+      truthy(!mustMention || msg.indexOf(mustMention) >= 0,
+        name + ' 抛错且点名「' + mustMention + '」：' + msg.slice(0, 70));
+    };
+
+    // 合法路径
+    const ok12 = applyPendingStatus(doc12(mkRow12('AP-20260928-0001-01', '待签批')),
+      T12([['AP-20260928-0001-01', 'DSP-20260928-0001-01', '事项', '人类A', '建议批准', 'R', '—', '待签批', '—']]), [toWant]);
+    eq(ok12.applied, 1, '正常回填应用 1 行');
+    truthy(ok12.md.indexOf('已签批·批准（2026-09-28）') >= 0, '  └ 目标状态已写入');
+    eq(applyPendingStatus(doc12(mkRow12('AP-20260928-0001-01', '已签批·批准（2026-09-28）')), T12([]), []).md,
+      doc12(mkRow12('AP-20260928-0001-01', '已签批·批准（2026-09-28）')), '无改动时逐字节原样返回（幂等）');
+    eq(planPendingStatus(T12([['AP-20260928-0001-01', 'DSP-20260928-0001-01', '', '', '', '', '', '已签批·批准（2026-09-28）', '']]), AP12).changes.length, 0,
+      '已抄过的行不再产生改动（跑第二遍不会反复改写）');
+    eq(statusTextFor({ rawConclusion: '大概可以吧', date: '2026-09-28' }), null, '结论取值不在白名单 → null（不猜）');
+    eq(statusTextFor({ rawConclusion: '批准', date: '28/9' }), null, '日期格式不对 → null（不猜）');
+    eq(statusTextFor({ rawConclusion: '有条件批准', date: '2026-09-27' }), '已签批·有条件批准（2026-09-27）', '四态之一正常派生');
+
+    // 反向：每个守卫都必须真的拦下来
+    throws('锚点缺失', () => applyPendingStatus('# 无锚点\n| x |\n', T12([['AP-1', '', '', '', '', '', '', '待签批', '']]), [{ ap: 'AP-1', from: '待签批', to: 'x' }]), '锚点');
+    throws('锚点不配对', () => applyPendingStatus('<!-- pending-approval-begin -->\n' + mkRow12('AP-20260928-0001-01', '待签批') + '\n', T12([['AP-20260928-0001-01', '', '', '', '', '', '', '待签批', '']]), [toWant]), '锚点');
+    throws('锚点内无表头行', () => applyPendingStatus('<!-- pending-approval-begin -->\n' + mkRow12('AP-1', '待签批') + '\n<!-- pending-approval-end -->\n', T12([['AP-1', '', '', '', '', '', '', '待签批', '']]), [{ ap: 'AP-1', from: '待签批', to: 'x' }]), '表头');
+    // 真的在格内放一根裸竖线：切分出 10 个数据列而表头是 9 列 → 必须拦下
+    throws('格内裸竖线导致列数错位', () => {
+      const bad = '| AP-20260928-0001-01 | DSP-20260928-0001-01 | 事项 | 备注里有|竖线 | 建议批准 | R | — | 待签批 | — |';
+      return applyPendingStatus(doc12(bad), T12([bad.split('|').slice(1, -1).map((s) => s.trim())]), [toWant]);
+    }, '裸竖线');
+    throws('单号匹配到 0 行', () => applyPendingStatus(doc12(mkRow12('AP-20260928-0001-01', '待签批')), T12([['AP-20260928-0001-01', '', '', '', '', '', '', '待签批', '']]), [{ ap: 'AP-9999-01', from: '待签批', to: 'x' }]), '匹配到 0 行');
+    throws('单号匹配到 2 行', () => applyPendingStatus(doc12(mkRow12('AP-20260928-0001-01', '待签批'), mkRow12('AP-20260928-0001-01', '待签批')), T12([['AP-20260928-0001-01', '', '', '', '', '', '', '待签批', '']]), [toWant]), '匹配到 2 行');
+    throws('状态列与计划旧值不符（并发改动）', () => applyPendingStatus(doc12(mkRow12('AP-20260928-0001-01', '待签批')), T12([['AP-20260928-0001-01', '', '', '', '', '', '', '待签批', '']]), [{ ap: 'AP-20260928-0001-01', from: '别人改过的值', to: 'x' }]), '与计划不符');
+    throws('目标状态含裸竖线', () => applyPendingStatus(doc12(mkRow12('AP-20260928-0001-01', '待签批')), T12([['AP-20260928-0001-01', '', '', '', '', '', '', '待签批', '']]), [{ ap: 'AP-20260928-0001-01', from: '待签批', to: '已签批·批准 | 有条件' }]), '裸竖线');
+    throws('表头缺「状态」列', () => applyPendingStatus(doc12(mkRow12('AP-20260928-0001-01', '待签批')), { headers: H12.filter((h) => h.indexOf('状态') < 0), rows: [] }, [toWant]), '缺列');
+
+    // 同一单号多行：**报 problem 且一条改动都不产出**
+    //   反向测试实测到这里抓出一个真 bug：原实现边走边查重，撞到重复时只 push 一条 problem
+    //   就 continue，于是**第一行早已产出了一条 change**——真去改就会改到其中一行。
+    //   「报了问题但仍然改了东西」比「什么都不改」更坏：台账看起来是处理过的。
+    const dup12 = planPendingStatus(T12([
+      ['AP-20260928-0001-01', 'DSP-20260928-0001-01', '', '', '', '', '', '待签批', ''],
+      ['AP-20260928-0001-01', 'DSP-20260928-0001-01', '', '', '', '', '', '待签批', '']]), AP12);
+    eq([dup12.problems.length, dup12.changes.length], [1, 0], '同一单号多行 → 报 1 条 problem 且**0 条改动**');
+    const mism12 = planPendingStatus(T12([['AP-20260928-0001-01', 'DSP-20260928-9999-99', '', '', '', '', '', '待签批', '']]), AP12);
+    eq([mism12.problems.length, mism12.changes.length], [1, 0], '关联派单号与台账不一致 → 拒绝抄写');
+
+    // 契约：调用方必须对 problem 硬失败，否则就是静默的部分回填
+    const syncSrc12 = await readFile(join(ROOT, 'scripts', 'approval-sync.mjs'), 'utf8');
+    truthy(/problemGate/.test(syncSrc12) && /process\.exit\(1\)/.test(syncSrc12),
+  'approval-sync 存在 problem 硬失败闸门（problem 不许被吞）');
+    truthy(/--no-pending-status/.test(syncSrc12), '  └ 提供 --no-pending-status 以便只刷视图');
+
+    // 「整格就是占位符」而非「提到占位符」——第 4 次栽在关键词匹配上
+    truthy(isBarePlaceholder('（待填）') && isBarePlaceholder('**（待填）**') && isBarePlaceholder('TODO'), '整格是占位符 → 判 true');
+    truthy(!isBarePlaceholder('② 文档同步**待补**'), '「文档同步待补」是正常中文 → 判 false（不误报既有行）');
+    truthy(!isBarePlaceholder('新增待补录04§4.3'), '「新增待补录」→ 判 false');
+  }
+
+  // 22.13 签批依据与台账现状的自相矛盾（validate 第 18 节）
+  //
+  // 起因：AP-20260928-1228-01 的决策依据写着「已重跑 approval-sync / dispatch-metrics 刷新。
+  // **条件既已满足，故落批准**」——而那两个脚本**根本不写待签批清单的状态列**，
+  // 该行状态当时仍是「待签批」。**条件并未满足。**
+  // 这是本体系第一次出现**写在人类签批台账上的不成立陈述**，且当时无人发现。
+  //
+  // ⚠ 能力边界（不得在任何文档里夸大）：本节查的是**机械可判定的矛盾**，
+  //   **不是**核实依据为真。绿灯的含义是「未发现矛盾」，仅此而已。
+  // ⚠ 它**防再犯，不证过去**：1228-01 的状态列今天已回填，直接跑真实数据必然 0 命中。
+  //   所以下面的酸测试必须**把历史状态模拟回去**，才能证明它当初抓得到。
+  {
+    const mk13 = (ap, basis, signDay) => [{ ap, basis, signDay }];
+
+    // 酸测试：模拟历史——把 1228-01 的队列状态改回「待签批」
+    const A13 = 'AP-20260928-1228-01';
+    const FALSE_BASIS = '③ 待签批清单未回填 → 已重跑 approval-sync / dispatch-metrics 刷新。**条件既已满足，故落批准。**';
+    const hist13 = new Map([[A13, '待签批']]);
+    const hit13 = auditApprovalBasis({
+      approvals: mk13(A13, FALSE_BASIS, '2026-09-28'), queueStatus: hist13, viewDays: new Map(),
+    }).violations.filter((v) => v.rule === 'A');
+    eq(hit13.length, 1, '判据 A 抓到了 1228-01 的「条件既已满足」（模拟历史状态）');
+    truthy(hit13.length ? /待签批/.test(hit13[0].detail) : false, '  └ 报红时点名队列状态仍是「待签批」');
+
+    // 队列状态若已回填 → 不报（这就是为什么它防再犯、不证过去）
+    eq(auditApprovalBasis({
+      approvals: mk13(A13, FALSE_BASIS, '2026-09-28'),
+      queueStatus: new Map([[A13, '已签批·批准（2026-09-28）']]), viewDays: new Map(),
+    }).violations.length, 0, '队列状态已回填 → 0 命中（**这正说明它不能证明过去，只能防再犯**）');
+
+    // 判据 B：按**脚本名**匹配（真实假话通篇没出现「状态视图」四个字）
+    // 键用文件名：`签批状态视图`/`状态视图` 是同一文件的两个别名，按别名建键会把
+    // 一次过期数成两条（反向测试实测：期望 1 实际 2）。
+    const vd13 = (day) => new Map([['签批状态视图.md', day], ['度量看板.md', day]]);
+    eq(auditApprovalBasis({ approvals: mk13('X-1', '已重跑 approval-sync 刷新', '2026-09-28'), queueStatus: new Map(), viewDays: vd13('2026-09-20') }).violations.length, 1,
+  '判据 B：产物比签批日早 8 天而依据称已重跑 → 报');
+    eq(auditApprovalBasis({ approvals: mk13('X-2', '已重跑 approval-sync 刷新', '2026-09-28'), queueStatus: new Map(), viewDays: vd13('2026-09-27') }).violations.length, 0,
+  '早 1 天 → 不报（±1 天容差用来吸收 UTC/本地时区差）');
+    eq(auditApprovalBasis({ approvals: mk13('X-3', '已重跑 approval-sync 刷新', '2026-09-28'), queueStatus: new Map(), viewDays: vd13('2026-09-29') }).violations.length, 0,
+  '产物比签批日新 → 不报');
+    eq(auditApprovalBasis({ approvals: mk13('X-4', '已修复监听器的空指针', '2026-09-28'), queueStatus: new Map(), viewDays: vd13('2026-09-01') }).violations.length, 0,
+  '不点名脚本的普通陈述 → 不报（防「只是提到」误报）');
+    truthy(PRODUCERS['approval-sync'].length > 0 && PRODUCERS['dispatch-metrics'].length > 0,
+  '脚本→产物映射表覆盖 approval-sync 与 dispatch-metrics（判据 B 靠它匹配）');
+
+    // 引述/否认语境必须放过：1228-01 的**更正子句**引述了那句假话并否认它
+    const denyBasis = '更正：上文「**条件既已满足**」**不属实**，当时只重跑了脚本而它们不写状态列。';
+    eq(auditApprovalBasis({ approvals: mk13(A13, denyBasis, '2026-09-28'), queueStatus: hist13, viewDays: new Map(),
+      // 判定落在引号内 + 明确否认 → 放过
+    }).violations.filter((v) => v.rule === 'A').length, 0,
+  '更正子句引述并否认该断言 → 不误报（正向判定：引号内是引用，不是主张）');
+
+    // 工具函数
+    eq(splitClauses('甲。① 乙；② 丙').length, 3, 'splitClauses 按句号与圈号断句');
+    eq(viewGeneratedAt('没有时间戳'), null, 'viewGeneratedAt 抽不到返回 null');
+    eq(daysStale('2026-09-26', '2026-09-28'), 2, 'daysStale 早 2 天 = 2');
+    eq(daysStale(null, '2026-09-28'), null, 'daysStale 缺输入返回 null（不猜）');
+
+    // 自证：一行都没读到时，「0 处矛盾」不可信
+    const empty13 = auditApprovalBasis({});
+    eq([empty13.inspected, empty13.clausesScanned], [0, 0], '空输入自报 inspected=0（validate 据此拒绝放行）');
+
+    // 接线处最容易漏：断言 validate 真的调了它
+    const vSrc13 = await readFile(join(ROOT, 'scripts', 'validate-expert-team.mjs'), 'utf8');
+    truthy(/auditApprovalBasis/.test(vSrc13), 'validate 确实调用了 auditApprovalBasis（lib 写了不等于接上了）');
+    truthy(/一行\/一子句都没读到/.test(vSrc13) || /inspected <= 0/.test(vSrc13),
+  'validate 对「一行都没读到」有自证拒绝放行（防假零）');
   }
 
 
