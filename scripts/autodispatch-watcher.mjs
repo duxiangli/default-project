@@ -33,6 +33,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { judgeDispatchConclusion } from './lib/dispatch-conclusion.mjs';
+import { readRunbook, hasSignedReview } from './lib/runbook.mjs';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { readFile, writeFile, readdir, rename, unlink } from 'node:fs/promises';
@@ -1155,6 +1156,9 @@ async function poll(ctx) {
   }
   log(`  通道探活通过（${h.ms}ms）`);
 
+  // 幂等终态判据要用：派单日志（找 需签批=Y 的行）与审批台账（找签批结论）。
+  // 这里读的是**本轮派单之前**的台账，故 lastHead 推进后不会自证——这是有意的。
+  const { dispatchTable, approvalTable } = await readRunbook(ROOT);
   // 派单前的台账行数基线：用于事后判断「这一轮到底有没有真的留痕」
   const rowsBefore = await countDispatchRows();
 
@@ -1180,8 +1184,39 @@ async function poll(ctx) {
      *   ② 台账留痕 —— router 声称做完但没写派单日志行，同样等于没留痕、无法审计。
      * 只判 ① 会漏掉「有结论但没落盘」；只判 ② 会漏掉「写了行但结论是空的」。
      */
-    if (!d.conclusion || !traced) {
-      const why = [!d.conclusion ? '无结论产出' : null, !traced ? '台账未新增派单行' : null].filter(Boolean).join(' 且 ');
+    /* ── 幂等终态补充判据（2026-09-28）：把「幂等跳过」认作已评审的终态 ──
+     *
+     * 背景（实测事故）：commit 6e9416c5 被派 **30 次**（17:48–22:54，每约 6 分钟一轮）。
+     *   机制：router 遇到已评审过的 commit 会**正确地拒绝重复评审**——它写了派单日志行
+     *   （traced=true）但**不产出结论块**（conclusion=false，因为确实没什么新可评）。
+     *   门把它判成失败 → 不推进 lastHead → 同一 commit 下一轮又进窗口 → 无限重派。
+     *   代价：每轮浪费一次 router 调用，并把**同一个 commit 排了 5 次待签批**。
+     *
+     * 判据（全部从台账取证，不看 router 的自然语言——本体系已栽在
+     *   「关键词匹配被『只是提到』骗到」上 4 次，不栽第 5 次）：
+     *   本批**每一条** commit 都已存在「需签批=Y 的派单行，且其 AP 已在审批台账有签批结论」。
+     *
+     * 这**不是**给 fail-closed 开口子：链路的最后一环是**人类的签字**。
+     *   该 commit 还没有一份被签过的评审时，signed 仍为 false，门继续 fail-closed。
+     *   即「幂等跳过」要等到「这份评审已被人类签批」之后才算终态。
+     *   用 every 而非 some：advanceToHash 在无溢出时是**本批最新**，
+     *   放行任何一条未签批的 commit 就等于让它被跳过 = 漏审。
+     */
+    const signedChecks = plan.take.map((c) => Object.assign(
+      { hash: c.hash.slice(0, 8) }, hasSignedReview(c.hash, { dispatchTable, approvalTable }),
+    ));
+    const idempotentTerminal = traced && !d.conclusion && signedChecks.every((x) => x.signed);
+    if (idempotentTerminal) {
+      log(`  [i] **幂等终态**：本批 ${plan.take.length} 条均已有**已签批**的评审记录，`
+        + 'router 本轮未产出结论块属正确行为（无新差异可评），按终态推进基线');
+      for (const x of signedChecks) log(`      ${x.hash}：${x.why}`);
+    }
+    if (!(d.conclusion && traced) && !idempotentTerminal) {
+      const why = [!d.conclusion ? '无结论产出' : null, !traced ? '台账未新增派单行' : null]
+        .filter(Boolean).join(' + ')
+        + (signedChecks.some((x) => !x.signed) && !d.conclusion
+          ? `；其中 ${signedChecks.filter((x) => !x.signed).map((x) => x.hash).join('、')} 尚无已签批的评审记录`
+          : '');
       repo.breaker = breakerUpdate(repo.breaker, { type: 'dispatch-fail', error: `fail-closed：${why}` });
       repo.lastCheck = cur;
       repo.failedDispatches = [...(repo.failedDispatches || []), {

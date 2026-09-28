@@ -20,6 +20,7 @@ import {
   effectiveDepth, RESTART_CHAIN_RESET_MS, driftIntervalMs,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict, parseSerial, isBarePlaceholder } from './lib/runbook.mjs';
+import { hasSignedReview, commitHashesIn, readRunbook } from './lib/runbook.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
 import { auditApprovalBasis, splitClauses, viewGeneratedAt, daysStale, PRODUCERS } from './lib/approval-basis-audit.mjs';
@@ -1133,6 +1134,63 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     truthy(/一行\/一子句都没读到/.test(vSrc13) || /inspected <= 0/.test(vSrc13),
   'validate 对「一行都没读到」有自证拒绝放行（防假零）');
   }
+  // 22.14 幂等终态判据（2026-09-28）：实测 commit 6e9416c5 被派 30 次、排 6 笔待签批
+  //
+  // 根因：fail-closed 门把「幂等跳过」（router 写了台账行但**不产出结论块**）判成失败
+  //   → 不推进 lastHead → 同一 commit 下一轮又进窗口 → 无限重派。
+  //   缺陷在**门的判定**，不在 router：router 每轮都正确地说「跳过」。
+  //
+  // 修法：当本批**每一条** commit 都已存在「需签批=Y 的派单行，且其 AP 已在审批台账有签批结论」
+  //   时，把幂等跳过认作终态并推进基线。**判据全部从台账取证**，不看 router 的自然语言
+  //   （本体系已栽在「关键词匹配被『只是提到』骗到」上 4 次，不栽第 5 次）。
+  //
+  // ⚠ 下面**最重要的一条断言是反向的**：没有任何签字时必须返回 false。
+  //   否则这条判据就成了「router 说跳过所以跳过」的后门。
+  {
+    const HASH = '6e9416c5';
+    const mk14 = (rows) => ({ headers: ['派单号', '时间', '事项摘要', '人类A', 'R', 'C', '派发', '结论摘要', '需签批'], rows });
+    const mkAp = (rows) => ({ headers: ['审批单号', '审批日期', '签批时间', '摘要', '关联派单', '人类A', 'R', 'C', '建议', '结论'], rows });
+
+    // commitHashesIn：只收含 a–f 的十六进制串，纯数字（日期 20260928）不算 hash
+    eq(commitHashesIn('事件推送·自主评审·commit 6e9416c5·签批 AP-20260928-1658-01'), ['6e9416c5'], '抽出 8 位短 hash');
+    eq(commitHashesIn('4-commit批次（d80a39ec, df4613a0）·幂等去重').sort(), ['d80a39ec', 'df4613a0'], '抽出多个 hash 并去重');
+    eq(commitHashesIn('commit 20260928 时间 1750'), [], '纯数字串不算 hash（否则日期会被当 commit）');
+    eq(commitHashesIn(''), [], '空输入返回空数组');
+
+    // ── 真实台账上：6e9416c5 已签批（1748-01），故应为 true ──
+    const book14 = await readRunbook(ROOT);
+    const real14 = hasSignedReview(HASH, { dispatchTable: book14.dispatchTable, approvalTable: book14.approvalTable });
+    truthy(/已签批|已在审批台账/.test(real14.why), '真实台账：6e9416c5 已有签字，why 应说明依据 → ' + real14.why);
+
+    // ── 反向测试：把签字抽掉，必须全部返回 false ──
+    const apNoSig = mkAp([]);
+    const dHasY = mk14([['DSP-20260928-1748-01', '', 'commit ' + HASH, '', '', '', '', '', 'Y']]);
+    eq(hasSignedReview(HASH, { dispatchTable: dHasY, approvalTable: apNoSig }).signed, false,
+      '有需签批=Y 的派单行但**审批台账无记录** → signed=false（最关键的一条：门不得放行）');
+    const dNoY = mk14([['DSP-20260928-1748-01', '', 'commit ' + HASH, '', '', '', '', '', 'N']]);
+    const apHas = mkAp([['AP-20260928-1748-01', '', '', '', '', '', '', '', '', '批准']]);
+    eq(hasSignedReview(HASH, { dispatchTable: dNoY, approvalTable: apHas }).signed, false,
+      '派单行是 需签批=N（幂等跳过）**即便审批台账有记录** → signed=false（幂等行不能当签字凭据）');
+    const dOther = mk14([['DSP-20260928-1111-01', '', 'commit deadbeef0', '', '', '', '', '', 'Y']]);
+    eq(hasSignedReview(HASH, { dispatchTable: dOther, approvalTable: apHas }).signed, false,
+      '派单行评的是**别的 commit** → signed=false（不能按列表第一个匹配就放行）');
+    eq(hasSignedReview('', { dispatchTable: dHasY, approvalTable: apHas }).signed, false, '空 hash → false');
+    eq(hasSignedReview(HASH, {}).signed, false, '空台账 → false');
+
+    // 前缀匹配必须双向可行（台账存 8 位、state 存 40 位）
+    const longHash = HASH + '0'.repeat(32);
+    eq(hasSignedReview(longHash, { dispatchTable: dHasY, approvalTable: apHas }).signed, true, '长 hash 与短 hash 前缀匹配');
+
+    // ── 门禁源码：聚合方式与放行条件 ──
+    const w14 = await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8');
+    truthy(/idempotentTerminal/.test(w14), 'watcher 源码含幂等终态判据');
+    truthy(/signedChecks\.every\(/.test(w14), '  └ 用 every 聚合（some 会让未签批的 commit 混过去 = 漏审）');
+    truthy(/traced && !d\.conclusion && signedChecks\.every/.test(w14),
+      '  └ 终态要求「有留痕 且 无结论块 且 全部已签批」三者同时成立');
+    truthy(/!\(d\.conclusion && traced\) && !idempotentTerminal/.test(w14),
+      '  └ 门禁条件为「非(有结论且有留痕)」且「非终态」——两条通路都过才放行');
+    truthy(/hasSignedReview/.test(w14), '  └ 门禁实际调用 hasSignedReview（不是自己另写一套）');
+  }
 
 
   // 关键：护栏必须**看得见**这些目录，否则等于没保护。  // 我第一版用 /^(\.git|...)/ 前缀匹配，`.github/` 被 `\.git` 前缀吃掉整个跳过
@@ -1171,14 +1229,21 @@ console.log('\n[23] fail-closed 门：失败轮次不得推进基线（①：曾
 
   // 23.2 门本身必须在代码里，且两个条件都在
   const src = await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8');
-  truthy(/if \(!d\.conclusion \|\| !traced\)/.test(src), '门条件为「无结论 或 未留痕」二者之一即拦');
+  // ⚠ 锚点已随门禁改写而更新（2026-09-28 幂等终态）。原断言锚在
+  //   `if (!d.conclusion || !traced)` 上，那是 fail-closed 的**旧**写法。
+  //   门禁现在是 `if (!(d.conclusion && traced) && !idempotentTerminal)`——
+  //   逻辑等价**且更严**（多一条终态通路），但字面不同，把上面两条断言一起搞红了。
+  //   教训与 §24.10 那条一致：**断言锚在代码字面上就会随改写而失效**。
+  //   方向是安全的（变红而非假绿），但仍要跟改，且**改的是锚点、不是被测语义**。
+  const GATE_RE = /if \(!\(d\.conclusion && traced\) && !idempotentTerminal\)/;
+  truthy(GATE_RE.test(src), '门条件为「非(有结论且有留痕)」且「非幂等终态」——二者都要满足才放行');
   truthy(/无结论产出/.test(src) && /台账未新增派单行/.test(src), '两种失败原因分别有独立措辞（便于归因）');
   truthy(/基线不推进（fail-closed）/.test(src), '日志明写基线不推进');
   truthy(/留待下轮重试/.test(src), '明写留待下轮重试（不静默丢弃）');
   truthy(/failedDispatches/.test(src), '失败轮次进状态留痕（可事后审计，不是只打日志）');
   truthy(/dispatch-fail/.test(src) && /fail-closed：/.test(src), '失败计入熔断并带原因');
   // 关键：推进基度的赋值必须落在门之后
-  const gateAt = src.indexOf('if (!d.conclusion || !traced)');
+  const gateAt = src.indexOf('if (!(d.conclusion && traced) && !idempotentTerminal)');
   // NOTE 锚点只取代码、不取行内注释：原锚点含「// 只推进到本批最旧一条…」
   //   2026-09-28 该注释随 planIncremental 语义更新后，这条语义断言被注释措辞搞红了。
   //   「repo.lastHead = …」在 src 中唯一（豁免路径那行是 advance.lastHead = …）。

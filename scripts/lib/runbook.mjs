@@ -171,3 +171,54 @@ export function approvalRecords(book) {
     };
   });
 }
+
+/**
+ * 从派单日志某行的「事项摘要」里抽出它评审过的 commit hash（短 hash，通常 8 位）。
+ * 只收**含 a–f 字母**的十六进制串：纯数字的 8 位串（例如日期 20260928）不是 hash。
+ */
+export function commitHashesIn(subject) {
+  const s = String(subject || '');
+  const out = new Set();
+  for (const m of s.matchAll(/\b([0-9a-f]{7,40})\b/g)) {
+    if (/[a-f]/.test(m[1])) out.add(m[1].toLowerCase());
+  }
+  return [...out];
+}
+
+/**
+ * 该 commit 是否已有**已签批的评审记录**（幂等终态判据的核心）。
+ *
+ * 为什么需要它（2026-09-28 实测事故）：
+ *   fail-closed 门是「有结论 且 有留痕」才推进 lastHead。router 遇到已评审过的 commit 会
+ *   **正确地拒绝重复评审**——它写了派单日志行（留痕=true）但**不产出结论块**
+ *   （结论=false，因为确实没什么新可评）。于是门把它判成失败 → 不推进基线 →
+ *   同一个 commit 下一轮又进窗口 → 无限重派。
+ *   实测 `6e9416c5` 被派 **30 次**（17:48–22:54），每 ~6 分钟一轮，
+ *   并把**同一个 commit 排了 5 次待签批**——等于要人类把同一件事签 5 遍。
+ *
+ * 为什么判据要**从台账取证**而不是看 router 说了什么：
+ *   「幂等去重 / 不重复派单 / 结论沿用」都是 router 的自然语言表达，
+ *   本体系已经栽在「关键词匹配被『只是提到』骗到」上 **4 次**，不栽第 5 次。
+ *   台账侧的事实是硬的：**存在一行 需签批=Y 的派单，且它对应的 AP 已在审批台账里有签批结论**。
+ *
+ * ⚠ 这条判据**不会让未评审的提交蒙混过关**：链路的最后一环是**人类的签字**。
+ *   只要该 commit 还没有一份被人类签过的评审，signed 仍为 false，门继续 fail-closed。
+ *   即：**幂等跳过要等到「这份评审已被人类签批」之后才算终态**，
+ *   避免「router 说跳过所以跳过」变成绕过评审的后门。
+ */
+export function hasSignedReview(commitHash, { dispatchTable, approvalTable } = {}) {
+  const h = String(commitHash || '').toLowerCase();
+  if (!h) return { signed: false, why: '无 commit hash' };
+  const approvals = new Set((approvalTable && approvalTable.rows || [])
+    .map((r) => String(r[0] || '').trim()).filter(Boolean));
+  for (const r of (dispatchTable && dispatchTable.rows || [])) {
+    if (!/^\s*Y\s*$/i.test(String(r[8] || ''))) continue;
+    const hashes = commitHashesIn(r[2]);
+    if (!hashes.some((x) => h.startsWith(x) || x.startsWith(h))) continue;
+    const ap = String(r[0] || '').trim().replace(/^DSP-/, 'AP-');
+    if (approvals.has(ap)) {
+      return { signed: true, why: `${String(r[0]).trim()} 标记需签批=Y，且 ${ap} 已在审批台账有签批结论` };
+    }
+  }
+  return { signed: false, why: '无「需签批=Y 且已被人类签批」的评审记录' };
+}
