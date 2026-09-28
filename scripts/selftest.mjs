@@ -22,6 +22,7 @@ import {
 import { classifyVerdict, parseSerial } from './lib/runbook.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
+import { judgeDispatchConclusion, extractConclusionBlocks } from './lib/dispatch-conclusion.mjs';
 import { partitionBlocks, missingFields, isRealConclusion, placeholderFieldCount } from './lib/conclusion-audit.mjs';
 import { auditHangRows, openHangClauses, contradictoryClauses, DISP_COL } from './lib/crosscheck-hang.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
@@ -104,11 +105,23 @@ console.log('\n[5] 增量分批计划（无缺口无重复）');
   const p1 = planIncremental(cs, 3);
   eq(p1.take.length, 3, '单批上限生效');
   eq(p1.overflow, 4, '溢出计数');
-  eq(p1.advanceToHash, 'h2', 'lastHead 推进到本批最旧一条');
+  eq(p1.advanceToHash, 'h2', '有溢出时仍推进到本批最旧一条（否则没进本批的更早提交会被跳过 = 漏审）');
   eq(p1.newestHash, 'h0', '新→旧排序，最新为 h0');
   const p2 = planIncremental(cs, 50);
-  eq([p2.take.length, p2.overflow, p2.advanceToHash], [7, 0, 'h6'], '不足上限时全派并推进到最旧');
+  // 2026-09-28 修「重复评审」：无溢出时本批已覆盖全部，推进到**最新**而非最旧。
+  // 原为 'h6'（最旧），导致最新的 h0 留在窗口里被反复评审（实测同一 commit 连评 5 次）。
+  eq([p2.take.length, p2.overflow, p2.advanceToHash], [7, 0, 'h0'], '无溢出时全派并推进到**最新**（否则重复评审）');
   eq(planIncremental([], 5).take.length, 0, '空输入安全');
+  // 关键不变量：无溢出推进到最新后，窗口里不该再有已评审的提交
+  {
+    const after = cs.filter((c) => c.hash !== p2.advanceToHash);
+    eq(after.length, 6, '推进到最新后仍有 6 条更早的提交待评审（它们确实还没被评过）');
+    truthy(!after.some((c) => c.hash === 'h0'), '  └ 已评审的最新的那条不再留在待评审集合里（重复评审的根因已除）');
+    // 有溢出时推进到最旧：更早的提交仍留在窗口，且**不会**跳过
+    const p3 = planIncremental(cs, 3);
+    const left3 = cs.filter((c) => !p3.take.some((t) => t.hash === c.hash));
+    eq(left3.length, 4, '有溢出时未进本批的 4 条全部留存（一条都不跳过）');
+  }
 }
 
 console.log('\n[6] 状态 fail-closed 与原子写');
@@ -213,8 +226,27 @@ console.log('\n[11] `opencode run` JSONL 解析 + 「有会话无结论」识别
   ].join('\n');
   const g = parseRunStream(good);
   eq(g.sessionId, 'ses_abc', '解析出会话 ID');
-  eq(g.texts, ['ROUTER_OK'], '解析出文本结论');
-  eq(g.conclusion, true, '有文本产出 → 判定结论已产出');
+  eq(g.texts, ['ROUTER_OK'], '解析出文本');
+  /* ⚠ 语义已于 2026-09-28 收紧，这条断言跟着改了。
+   * 原来写 `eq(g.conclusion, true, '有文本产出 → 判定结论已产出')`——**它编码的正是那个漏洞**：
+   * 只要有任何非空输出就算「有结论」。实测后果：同一 commit 的 5 次派单中 3 次**零专家子会话**
+   * 却照样 conclusion=true、照样留痕、照样推进 lastHead。
+   * 现在必须有**符合契约的结论块**才算有结论。
+   */
+  eq(g.conclusion, false, '只有普通文本（ROUTER_OK，无结论块）→ **判无结论**（收紧后；旧语义会放行）');
+  truthy(/无结论块/.test(g.conclusionAudit.why), '  └ 判定细节点名「无结论块」，便于线上定位');
+  const withBlock = [
+    JSON.stringify({
+      type: 'text', sessionID: 'ses_abc',
+      part: {
+        type: 'text',
+        text: '<!--结论\n事项: 评审 commit abc\nR: expert/16-devops-sre\nC: expert/18-security\n四态: 建议批准\n'
+          + '严重度: 低\n依据: a.mjs:1\n风险: 无\n行动: 动作=做; 责任人=expert/16; 时限=今日\n'
+          + '升级对象: 无\n数据缺失: 无\n-->',
+      },
+    }),
+  ].join('\n');
+  eq(parseRunStream(withBlock).conclusion, true, '有符合契约的结论块 → 判定结论已产出');
 
   const silent = JSON.stringify({ type: 'step_start', sessionID: 'ses_silent', part: { type: 'step-start' } });
   const s = parseRunStream(silent);
@@ -895,6 +927,43 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     eq(openHangClauses('① 第 17 节挂账项已上线；② 该缺陷**未修**').length, 1,
       '  └ 但同一句里真的「未修」仍被抓到（精确列举，不放宽规则）');
   }
+  // 22.11 派单结论判定（原判定太宽，是「结论凭空产生」的口子）
+  //
+  // 2026-09-28 DSP-20260928-1424-01 复核实测：同一 commit 的 5 次派单中有 3 次
+  // **零专家子会话**，却照样 conclusion=true、照样留痕、照样推进 lastHead。
+  // 原判定是 `texts.some(x => x.trim().length > 0) && errors.length === 0`——
+  // 只要**有任何非空输出**就算「有结论」。
+  //
+  // 收紧后必须存在**符合契约的专家结论块**。且**不能简单搜 `<!--结论`**：
+  // router 提示词里**含契约模板**，模板同样带该标记与占位符，按标记判会把模板当结论。
+  //
+  // 本组断言同时钉住一次**测试当场抓出的漏洞**：第一版占位检查只认「整值就是占位符」，
+  // 于是提示词里的契约模板（`事项: <一句话>` 但 `四态: 建议批准 | …`）被放行。
+  // 现改为**任一必填字段含占位符即不合格**——真结论里绝不该出现 `<一句话>`。
+  {
+    const REAL = '<!--结论\n事项: 评审 commit abc\nR: expert/16-devops-sre\nC: expert/18-security\n四态: 建议批准\n严重度: 低\n依据: a.mjs:1\n风险: 无\n行动: 动作=做; 责任人=expert/16; 时限=今日\n升级对象: 无\n数据缺失: 无\n-->';
+    const DASH = REAL.replace('严重度: 低', '严重度: —');
+    // router 提示词里那段契约模板：字段名齐全，但值全是占位符
+    const TPL = '模板：\n<!--结论\n事项: <一句话>\nR: expert/xx\n四态: 建议批准 | 有条件通过 | 驳回 | 需人工\n严重度: 高 | 中 | 低\n依据: <文件:行号>\n行动: 动作=<做什么>; 责任人=<角色>\n升级对象: <名册职位全称>\n-->';
+    const ECHO = '<!--结论\n事项: ...\nR: expert/xx\n四态: ...\n严重度: ...\n依据: ...\n行动: ...\n升级对象: ...\n-->';
+
+    eq(judgeDispatchConclusion([REAL]).ok, true, '合规结论块 → 有结论');
+    eq(judgeDispatchConclusion([DASH]).ok, true, '「严重度: —」是合法取值 → 仍算有结论');
+    eq(judgeDispatchConclusion([]).ok, false, '空产出 → 无结论');
+    eq(judgeDispatchConclusion(['一些无关文字']).ok, false, '有文字但无结论块 → 无结论（原判定会放行）');
+    eq(judgeDispatchConclusion([TPL]).ok, false, '只有提示词里的契约模板 → 无结论（**第一版会误放行**）');
+    eq(judgeDispatchConclusion([ECHO]).ok, false, '回抄契约未填 → 无结论');
+    eq(judgeDispatchConclusion([TPL, REAL]).ok, true, '模板与真块混杂 → 仍认得出真块');
+
+    // 判定细节必须能区分「没出块」与「出块不合规」，否则线上无法定位
+    eq(judgeDispatchConclusion([]).why, '无结论块', '无结论块时的理由文案');
+    truthy(/占位符/.test(judgeDispatchConclusion([TPL]).why), '模板被判不合格时理由点名「占位符」');
+    truthy(judgeDispatchConclusion([TPL]).detail.length > 0, '不合格时附片段便于人工定位');
+
+    eq(extractConclusionBlocks('a<!--结论x-->b<!--结论y-->').length, 2, '能从一段文本里抽出多个结论块');
+    eq(extractConclusionBlocks('没有标记').length, 0, '无标记返回 0 个');
+  }
+
 
   // 关键：护栏必须**看得见**这些目录，否则等于没保护。  // 我第一版用 /^(\.git|...)/ 前缀匹配，`.github/` 被 `\.git` 前缀吃掉整个跳过
   // ——用来堵洞的护栏自己漏掉了 CI 流水线目录，正是它本该消除的那类盲区。
@@ -940,7 +1009,10 @@ console.log('\n[23] fail-closed 门：失败轮次不得推进基线（①：曾
   truthy(/dispatch-fail/.test(src) && /fail-closed：/.test(src), '失败计入熔断并带原因');
   // 关键：推进基度的赋值必须落在门之后
   const gateAt = src.indexOf('if (!d.conclusion || !traced)');
-  const advAt = src.indexOf('repo.lastHead = plan.advanceToHash; // 只推进到本批最旧一条');
+  // NOTE 锚点只取代码、不取行内注释：原锚点含「// 只推进到本批最旧一条…」
+  //   2026-09-28 该注释随 planIncremental 语义更新后，这条语义断言被注释措辞搞红了。
+  //   「repo.lastHead = …」在 src 中唯一（豁免路径那行是 advance.lastHead = …）。
+  const advAt = src.indexOf('repo.lastHead = plan.advanceToHash;');
   truthy(gateAt > 0 && advAt > gateAt, '推进基线的赋值在门之后（顺序反了门就白设）');
   // 豁免路径也要推进基线，但它不经过这道门——确认它是独立分支且写明「豁免≠通过」
   truthy(/豁免派单/.test(src) && /豁免≠通过/.test(src), '豁免路径独立且明写「豁免≠通过」');
@@ -1041,6 +1113,14 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
     const bdir = join(tmp, 'degrade-behaviour');
     await mkdir(join(bdir, 'scripts', 'lib'), { recursive: true });
     await copyFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), join(bdir, 'scripts', 'autodispatch-watcher.mjs'));
+    // ⚠ 必须一并复制 scripts/lib/：watcher 现在 `import './lib/dispatch-conclusion.mjs'`
+    //   （2026-09-28 收紧 conclusion 判定时新增）。只复制 watcher 本体 → 临时目录里 import 失败
+    //   → 启动即崩 → 本节全部断言红灯，且**报的是「前置没起来」而非真因**，极难定位。
+    //   教训：给动态加载的文件做测试夹具时，依赖要跟着走，别只拷主体。
+    for (const dep of ['conclusion-audit.mjs', 'dispatch-conclusion.mjs', 'runbook.mjs', 'whitelist-audit.mjs', 'watchdog.mjs', 'crosscheck-hang.mjs']) {
+      const from = join(ROOT, 'scripts', 'lib', dep);
+      try { await copyFile(from, join(bdir, 'scripts', 'lib', dep)); } catch { /* lib 里没有就跳过 */ }
+    }
     // 源指纹只覆盖 watcher + scripts/lib/*.mjs，故必须有这个 lib 文件才改得动指纹
     const libFile = join(bdir, 'scripts', 'lib', 'probe.mjs');
     await writeFile(libFile, 'export const V = 1;\n', 'utf8');
@@ -1111,7 +1191,14 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
       + '故不能拿退出码判「是否自行退出」——本地那次就是假通过）');
     truthy(run.aliveBeforeKill,
       '24.9 **行为**：动手 kill 的那一刻进程仍活着（exitCode/signalCode 均为 null 且尚未 close）');
-    truthy(!/STDERR:/.test(run.text), '24.9 行为：降级过程无 stderr（不崩）');
+    // ⚠ 不能断言「stderr 全空」：2026-09-28 收紧 conclusion 判定后，watcher 会往 stderr
+    //   打一行 `[warn] 本次派单未通过结论判定：…`——那是**预期的告警**，不是崩溃。
+    //   原来写 `!/STDERR:/` 会把它当崩溃而误报（实测踩到）。
+    //   改为断言「无崩溃类错误」，并单独确认该告警属于预期。
+    truthy(!/ReferenceError|TypeError|is not defined|SyntaxError/.test(run.text),
+      '24.9 行为：降级过程无崩溃类错误（ReferenceError/TypeError/未定义/语法错）');
+    truthy(!/Error:/.test(run.text.replace(/\[warn\][^\n]*/g, '')),
+      '  └ 排除预期告警后无任何 Error 行');
     // 每轮重申：漂移定时器至少 tick 了两次，第二次应打出重申行
     const reShout = (run.text.match(/仍在降级模式/g) || []).length;
     truthy(reShout >= 1, `24.9 行为：降级状态每轮重申（实测重申 ${reShout} 次，防变相静默）`);
@@ -1152,10 +1239,18 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
       .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
       .join('\n');
     const importLines = codeOnly.split(/\r?\n/).filter((l) => /^\s*import\b/.test(l));
-    const projectImports = importLines.filter((l) => /from\s+'\.\.?\//.test(l));
-    eq(projectImports.length, 0,
-      'watcher 没有任何项目模块的静态 import（故只有它自身会 ESM 陈旧）——若此断言失败，指纹覆盖必须同步扩大');
-    truthy(!/import\(\s*['"]\.\.?\//.test(codeOnly), '也没有项目模块的动态 import（已剥注释，避免匹配到说明文档本身）');
+    // ⚠ 本条断言在 2026-09-28 **真的触发了**：收紧 conclusion 判定时我给 watcher 加了
+    //   `import { judgeDispatchConclusion } from './lib/dispatch-conclusion.mjs'`，
+    //   于是「零项目模块 import」不再成立。**这正是它该做的事**——把一处新增依赖逼到台面上复核。
+    //   复核结论：指纹覆盖 `scripts/lib/*.mjs`，**本来就覆盖该文件，无需扩大**。
+    //   故把不变量从「不许有 import」改为**「有 import 时必须在指纹覆盖范围内」**——
+    //   前者会逼着人别写代码，后者才是真正的约束。
+    const projImports = importLines.map((l) => (l.match(/from '\.\.\/([^']+)'/) || [])[1]).filter(Boolean);
+    for (const p of projImports) {
+      truthy(p.startsWith('lib/'), `项目模块 import 指向 ${p} —— 必须在 scripts/lib/ 下（指纹覆盖该目录；lib 之外的路径需同步扩大 sourceFingerprint）`);
+    }
+    truthy(!/import\(\s*['"]\.\.\/(?!lib\/)/.test(codeOnly), '没有指向 lib/ 之外的动态 import');
+    truthy(/pathToFileURL/.test(w2), 'pathToFileURL 仅用于 main 模块判定（不是加载业务代码）');
     truthy(/pathToFileURL/.test(w2), 'pathToFileURL 仅用于 main 模块判定（不是加载业务代码）');
 
     // gate 脚本确实是 spawn 子进程跑的——这正是它们不会陈旧的根据

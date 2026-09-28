@@ -39,23 +39,33 @@ export function missingFields(block) {
  *   · 占位值检查 → 挡回抄未填（字段名齐全但值是 ...）
  * 我先只做了前者，被 selftest 当场测出来（见 scripts/selftest.mjs 22.9）。
  */
-const PLACEHOLDER_VALUE = /(?:^|\s)(?:\.{3}|…|<[^>]*>|expert\/xx)\s*(?:\n|$)/;
-/** 数一数「字段名在、但值是占位符」的有几个 */
+const PLACEHOLDER_VALUE = /\.{3}|…|<[^>]*>|expert\/xx/;
+
+/** 该字段的值里是否含占位符（`...` / `…` / `<...>` / `expert/xx`） */
+function fieldHasPlaceholder(value) {
+  return PLACEHOLDER_VALUE.test(String(value || ''));
+}
+
+/** 数一数「字段名在、但值含占位符」的有几个 */
 export function placeholderFieldCount(block) {
   const s = String(block || '');
   let n = 0;
   for (const [name] of REQUIRED_FIELDS) {
-    // 取该字段名之后、到下一个换行为止的内容
     const m = new RegExp(name + '\\s*[:：]\\s*([^\\n]*)').exec(s);
-    if (m && PLACEHOLDER_VALUE.test(m[1])) n++;
+    if (m && fieldHasPlaceholder(m[1])) n++;
   }
   return n;
 }
 
 export function isRealConclusion(b) {
   if (missingFields(b).length) return false;
-  // 半数以上必填字段的值是占位符 → 回抄未填的退化块
-  if (placeholderFieldCount(b) >= Math.ceil(REQUIRED_FIELDS.length / 2)) return false;
+  // ⚠ 判据收紧（2026-09-28）：**任一**必填字段的值含占位符即不合格。
+  // 原来只要求「半数以上是占位符」，结果 router 提示词里的**契约模板**被判成真结论——
+  //   该模板 `事项: <一句话>` 带尖括号，但 `四态: 建议批准 | 有条件通过 | …` 不是纯占位符，
+  //   于是「占位值计数」没达标，模板被放行。
+  //   而它会被 export 与 judgeDispatchConclusion 当成专家的真结论 —— **正是本次要堵的「假原文」。**
+  //   真结论里绝不会出现 `<一句话>` 这种尖括号占位符，故任一命中即不合格。
+  if (placeholderFieldCount(b) > 0) return false;
   return true;
 }
 
@@ -73,8 +83,8 @@ export function partitionBlocks(candidates, maxLen = 8000) {
     const miss = missingFields(b);
     if (miss.length) { bogus.push({ b, why: '缺契约必填字段：' + miss.join('/') }); continue; }
     const ph = placeholderFieldCount(b);
-    if (ph >= Math.ceil(REQUIRED_FIELDS.length / 2)) {
-      bogus.push({ b, why: `${ph} 个必填字段的值仍是占位符（回抄契约未填）` });
+    if (ph > 0) {
+      bogus.push({ b, why: `${ph} 个必填字段的值仍含占位符（回抄契约未填，或这是提示词里的模板）` });
       continue;
     }
     real.push(b);
