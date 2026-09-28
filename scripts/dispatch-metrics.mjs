@@ -92,6 +92,18 @@ export function computeMetrics(book, { days = 30 } = {}) {
 export function renderDashboard(m) {
   const L = [];
   L.push(`> 由 \`node scripts/dispatch-metrics.mjs\` 生成；口径见 05-落地清单与度量.md。机械计算项与「需人工采集」项已分开标注。`);
+  // 生成时间戳（2026-09-28 补）
+  //
+  // 为什么加：本文件原先**没有任何生成时间**，而 `签批状态视图.md` 有。
+  // 于是两个「自动生成的派生视图」里有一个**无法判断是否过期**——
+  // 这正是 expert/20-docs 在 DSP-20260928-1228-01 抱怨「状态视图滞后」的另一半：
+  // 滞后之所以难发现，正是因为其中一份没有可判定的新鲜度。
+  // 复核时我自己的取证脚本也因为找不到它而误判「条件未满足」。
+  //
+  // 格式与签批状态视图保持一致（ISO 空格分隔），并且**用 UTC**——
+  // 本仓库的自动产物一律记 UTC（watcher.log 亦然），本地时间 = UTC+8。
+  // 混用会导致「看板比派单还早」这类假阴性（已踩过一次）。
+  L.push(`> 生成时间：${(m.generatedAt || new Date().toISOString().replace('T', ' ').slice(0, 19))}（UTC）　·　数据源：\`派单日志.md\` + \`待签批清单.md\` + \`审批记录.md\``);
   L.push('');
   L.push('## 1. 派单吞吐');
   L.push('');
