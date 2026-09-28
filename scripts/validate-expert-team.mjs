@@ -5,6 +5,8 @@
  */
 import { readdir, readFile as rawReadFile } from 'node:fs/promises';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
+import { judgeHeartbeat, resolveThreshold, VERDICT } from './lib/watchdog.mjs';
+import { execFileSync } from 'node:child_process';
 
 /** 统一归一化换行：CRLF 检出（Windows）下校验结果必须与 LF 检出（Linux CI）一致 */
 const rd = async (p, enc = 'utf8') => (await rawReadFile(p, enc)).replace(/\r\n/g, '\n');
@@ -542,6 +544,35 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
   // 另有一类**本检查抓不到**的偏差必须显式说明：号与时间列互相自洽、但两者都≠真实派单时刻。
   // DSP-20260927-0110-01 就是这种（号 01:10 / 时间列 01:10 / 真实 02:32:11，偏差 82 分钟），
   // 故本检查**只能证内部自洽，不能证时间真实**——真实性证据在 logs/watcher.log。
+
+  // 常驻心跳自检：watcher 是否还在跑（2026-09-28，因 14 小时静默停服而加）
+  //
+  // 三态判定，**UNKNOWN 绝不冒充绿灯**——logs/ 被 gitignore，CI 上没有日志是正常的，
+  // 但「读不到日志」不等于「心跳正常」。把它当通过就是假保证，比没有检查更坏。
+  {
+    const logPath = path.join(ROOT, 'logs', 'watcher.log');
+    let logText = null;
+    try { logText = await rawReadFile(logPath, "utf8"); } catch { logText = null; }
+    // 本机是否应当有常驻：Windows 上查计划任务；其他环境（CI/Linux）不声明
+    let residentExpected = false;
+    if (process.env.AUTODISPATCH_RESIDENT_EXPECTED === '1') residentExpected = true;
+    else if (process.platform === 'win32') {
+      try { execFileSync('powershell', ['-NoProfile', '-Command',
+        "(Get-ScheduledTask -TaskName 'OpenCode-ExpertTeam-Autodispatch' -ErrorAction SilentlyContinue) -ne $null"],
+        { stdio: 'ignore', timeout: 8000 }); residentExpected = true; } catch { residentExpected = false; }
+    }
+    const thr = resolveThreshold(Number(process.env.AUTODISPATCH_MAX_SILENCE || 0), 120);
+    const hb = judgeHeartbeat({ logText, residentExpected, maxSilenceSec: thr });
+    if (hb.verdict === VERDICT.FRESH) {
+      ok(`常驻心跳：正常，` + hb.reason);
+    } else if (hb.verdict === VERDICT.STALE) {
+      bad('常驻心跳：**超过 ' + Math.round(hb.thresholdSec / 60) + ' 分钟无心跳** → ' + hb.reason);
+    } else {
+      // 关键：不记 ok 也不记 fail，而是显式说明无法评估——避免给出虚假安心
+      log('  ⚠ 常驻心跳：**无法评估**（' + hb.reason + '）——这既不算通过也不算失败，请知悉');
+    }
+  }
+
   if (tsNew.length === 0) {
     ok('派单时间戳：无新增不符（仅证号与时间列自洽；时间真实性证据在 logs/watcher.log，本检查证不了）');
     for (const [k, why] of Object.entries(KNOWN_TS)) {

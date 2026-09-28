@@ -1,4 +1,4 @@
-<#
+﻿<#
   专家团 watcher 常驻自启安装器（Windows 计划任务）
 
   作用：注册一个「用户登录时」自动启动的计划任务，运行 scripts/autodispatch-watcher.mjs 常驻模式。
@@ -14,6 +14,11 @@
 param(
   [switch]$Uninstall,
   [switch]$Start,
+  # 只注册/刷新看门狗，不碰主任务。
+  # 为什么需要：Register-ScheduledTask -Force 会**停掉正在运行的主任务**（实测 2026-09-28），
+  # 于是「只想更新看门狗」也会顺手杀掉在途派单、打断子会话、留下悬空序列号。
+  # 实测就因此打断了 DSP-20260928-1141-01。改看门狗请用这个开关。
+  [switch]$WatchdogOnly,
   [int]$IntervalSeconds = 120,
   [string]$TaskName = "OpenCode-ExpertTeam-Autodispatch"
 )
@@ -43,8 +48,13 @@ if ($Uninstall) {
 
 if (-not (Test-Path $watcher)) { throw "找不到 watcher：$watcher" }
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+# principal 被主任务与看门狗共用，故提到守卫之外
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
-# 包装成 .cmd：解决「计划任务里 node 路径含空格 + 工作目录」两个经典坑
+# -WatchdogOnly：只刷新看门狗，跳过主任务。理由见 param 处的注释——
+# 重新注册主任务会停掉正在跑的常驻，从而打断在途派单。
+if (-not $WatchdogOnly) {
+# 包装成 .cmd解决计划任务里 node 路径含空格 + 工作目录两个经典坑
 $cmdPath = Join-Path $logDir "run-watcher.cmd"
 $cmd = @(
   "@echo off",
@@ -52,7 +62,7 @@ $cmd = @(
   "cd /d `"$repo`"",
   "`"$node`" `"$watcher`" --interval $IntervalSeconds --dispatch-timeout 3600 >> `"$logFile`" 2>> `"$errFile`""
 ) -join "`r`n"
-# 用 oem/utf8 混合环境安全的写法：ASCII 兜底，路径含非 ASCII 时由 chcp 65001 兜住
+# 用 oem/utf8 混合环境安全的写法ASCII 兜底路径含非 ASCII 时由 chcp 65001 兜住
 Set-Content -Path $cmdPath -Value $cmd -Encoding UTF8
 Write-Host "Launcher : $cmdPath"
 
@@ -66,12 +76,45 @@ $settings = New-ScheduledTaskSettingsSet `
   -RestartCount 3 `
   -RestartInterval (New-TimeSpan -Minutes 5) `
   -MultipleInstances IgnoreNew
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
   -Settings $settings -Principal $principal -Force | Out-Null
 Write-Host "[OK] Registered: $TaskName (at logon; restart 3x/5min; ignore duplicate instances)" -ForegroundColor Green
 Write-Host "Log      : $logFile"
+}
+
+# - 看门狗2026-09-28因 14 小时静默停服而加 -
+# 背景那次 watcher 退出后计划任务状态是 Ready不是 Failed熔断器 green
+#   stderr 静CI 全绿**没有任何东西发现它不在了**
+# 而上面那个 -RestartCount 实测无效7 分钟无反应所以不能指望它兜底
+# 故注册一个**独立于 watcher 自己**的周期任务每 5 分钟查心跳超阈值或进程不在就重启
+# 注意RestartCount 那一项留着但**不再当兜底**-它对批处理动作不生效已实测
+$watchdogName = "OpenCode-ExpertTeam-Watchdog"
+$wdScript = Join-Path $repo 'scripts\watchdog.ps1'
+$wdLog = Join-Path $repo 'logs\watchdog.log'
+if (Test-Path $wdScript) {
+  if (Get-ScheduledTask -TaskName $watchdogName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $watchdogName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $watchdogName -Confirm:$false
+  }
+  # NOTE: keep this comment ASCII-only. Non-ASCII punctuation inside PowerShell
+  # comments has broken the whole script parser (unterminated string) more than once.
+  # Build the argument string by joining parts; do NOT use backtick-escaped quotes.
+  $wdArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wdScript)
+  $wdArgLine = ($wdArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+  $wdAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $wdArgLine -WorkingDirectory $repo
+  $wdTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5)
+  $wdSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+  Register-ScheduledTask -TaskName $watchdogName -Action $wdAction -Trigger $wdTrigger `
+    -Settings $wdSettings -Principal $principal -Force | Out-Null
+  Write-Host "[OK] Registered: $watchdogName (every 5min; restart watcher if heartbeat stale >7min)" -ForegroundColor Green
+  Write-Host "WdLog    : $wdLog"
+} else {
+  Write-Warn "[--] 未找到 scripts\watchdog.ps1，跳过看门狗注册（将无法自动发现 watcher 停服）"
+}
 
 if ($Start) {
   Start-ScheduledTask -TaskName $TaskName

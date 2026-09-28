@@ -12,3 +12,11 @@ logs/
 # 系统杂项
 .DS_Store
 Thumbs.db
+
+# 与本专家团体系无关的外部资料（2026-09-28 加入）
+# free-model-test/ 是 2026-09-26 的免费模型横评报告，归属未查明。
+# 曾被 `git add -A` 误扫进 commit 577b523，**内容已原样移出仓库**至
+#   C:\Users\duxiangli\Documents\free-model-test-20260926
+# （逐文件字节数校验一致，5 个文件）
+# 移出而非删除，是为了它不再因一次 `git clean` 永久丢失。
+free-model-test/

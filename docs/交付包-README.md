@@ -9,6 +9,9 @@
 | 跨平台配置包 | `跨平台配置包/docs/expert-team/` | 21 张卡（00-路由Agent + 20 岗位卡）、主文档 00~05、RACI 矩阵 CSV、首席名册、审计/审批台账。导入 **Dify / Coze / LangGraph / AutoGen / GitLab Duo / 自研平台** |
 | OpenCode Agent 版 | `OpenCode-Agent版/.opencode/` | 1 个路由 Agent（primary，自主派单留痕）+ 20 个专家子 Agent（subagent，只读）+ `opencode.jsonc`（`default_agent=router`，MCP gitlab/jira 默认 disabled 样例） |
 | 运维脚本 | `scripts/` | `validate-expert-team.mjs`（体系一致性 多节校验）、`sync-roster.mjs`（名册 → 岗位卡/Agent/路由表同步）、`autodispatch-watcher.mjs`（本地 git 新提交 → 自主派单监听，零凭据）、`approval-sync.mjs` + `dispatch-metrics.mjs` + `guard-audit.mjs`（签批闭环同步 / 度量看板 / 治理契约审计）、`selftest.mjs`（自动化自测）、`export-bundle.mjs`（重新生成本包）、`lib/runbook.mjs`（台账解析公共库） |
+| 门禁与看门狗 | `scripts/lib/whitelist-audit.mjs` | **免评审白名单正向语义审计**：把每条模式在整棵文件树上展开，逐个判定「是否可证为机器生成」；PROTECTED 优先、UNKNOWN 与死规则一律 fail-closed（不依赖任何样例） |
+| 门禁与看门狗 | `scripts/lib/watchdog.mjs` | **常驻心跳三态判定**：FRESH / STALE / UNKNOWN。UNKNOWN 绝不冒充绿灯——读不到日志、或读到冻结的历史日志，都判「无法评估」而非通过 |
+| 门禁与看门狗 | `scripts/watchdog.ps1` | **常驻看门狗**（计划任务每 5 分钟）：心跳超 7 分钟或进程不在则重启 watcher；并扫描「日志已宣告但台账查无此号」的悬空序列号，区分在途与作废 |
 
 ## 快速导入
 

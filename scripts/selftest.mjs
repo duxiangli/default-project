@@ -21,6 +21,7 @@ import {
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict, parseSerial } from './lib/runbook.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
+import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
 import { matchPathRules, buildDotPathNotice } from './autodispatch-watcher.mjs';
 import { globSync, existsSync } from 'node:fs';
@@ -714,6 +715,47 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
   };
   await walk('');
   truthy(realFiles.length > 50, `真实文件树收集成功（${realFiles.length} 个文件）`);
+
+  // 22.7 常驻心跳自检（2026-09-28，因 14 小时静默停服而加）
+  //
+  // 核心约束：**UNKNOWN 绝不冒充绿灯**。两种「假绿」都必须堵：
+  //   ① 读不到日志（logs/ 被 gitignore，CI 干净检出必然如此）→ 报绿就是虚假安心；
+  //   ② 读到一份**冻结的历史日志**（若有人把 logs/ 提交上去，CI 每次都看到同一份旧心跳）→ 报绿同样是假绿。
+  {
+    const NOW = new Date('2026-09-28T04:00:00Z');
+    const log = (ts) => `[2026-09-28 03:50:00] poll done：无新提交\n[${ts}] poll done：无新提交\n`;
+    const THR = resolveThreshold(0, 120);
+    truthy(THR === 420, `阈值 = max(给定, 间隔×3+60) = ${THR}s（>3 个轮询周期，正常间隔不会误报）`);
+    eq(resolveThreshold(1800, 120), 1800, '显式给定的更大阈值被尊重');
+    eq(resolveThreshold(60, 300), 960, '间隔大时自动抬高阈值（300×3+60）');
+
+    // 正常在跑
+    eq(judgeHeartbeat({ logText: log('2026-09-28 03:59:00'), residentExpected: true, maxSilenceSec: THR, now: NOW }).verdict, VERDICT.FRESH, '心跳新鲜且声明有常驻 → FRESH');
+    // 停服（本次事故形态）
+    const stale = judgeHeartbeat({ logText: log('2026-09-27 23:01:04'), residentExpected: true, maxSilenceSec: THR, now: NOW });
+    eq(stale.verdict, VERDICT.STALE, '心跳超阈值且声明有常驻 → STALE（能抓住停服）');
+    truthy(/常驻疑似已停/.test(stale.reason), 'STALE 给出可执行的处置指引');
+    // 假绿①：无日志
+    for (const [label, expected] of [['CI 非宿主', false], ['声明有常驻却无日志', true]]) {
+      const r = judgeHeartbeat({ logText: null, residentExpected: expected, maxSilenceSec: THR, now: NOW });
+      eq([label, r.verdict], [label, VERDICT.UNKNOWN], `无日志（${label}）→ UNKNOWN，不报绿`);
+      truthy(/不等于通过|不适用/.test(r.reason), `  └ 理由显式说明「不等于通过」`);
+    }
+    // 假绿②：冻结的历史日志
+    const frozen = judgeHeartbeat({ logText: log('2026-09-28 03:59:00'), residentExpected: false, maxSilenceSec: THR, now: NOW });
+    eq(frozen.verdict, VERDICT.UNKNOWN, '心跳新鲜但不声明有常驻 → UNKNOWN（防「冻结日志」假绿）');
+    truthy(/不代表此刻有常驻在跑/.test(frozen.reason), '  └ 理由点明「有日志≠有常驻在跑」');
+    // 其他 UNKNOWN 情形
+    eq(judgeHeartbeat({ logText: 'hello\n', residentExpected: true, maxSilenceSec: THR, now: NOW }).verdict, VERDICT.UNKNOWN, '日志无心跳行 → UNKNOWN');
+    eq(judgeHeartbeat({ logText: log('2099-01-01 00:00:00'), residentExpected: true, maxSilenceSec: THR, now: NOW }).verdict, VERDICT.UNKNOWN, '心跳在未来（时钟/时区错位）→ UNKNOWN，不默默算成新鲜');
+    // 日志解析
+    eq(lastHeartbeat('[2026-09-28 01:02:03] x\n[2026-09-28 04:05:06] y\n'), { at: '2026-09-28T04:05:06Z', line: 2, text: '[2026-09-28 04:05:06] y' }, '取最后一条心跳（而非第一条）');
+    eq(lastHeartbeat('没有心跳的行\n'), null, '无心跳返回 null');
+    eq(lastHeartbeat(''), null, '空日志返回 null');
+    eq(lastHeartbeat(null), null, 'null 日志返回 null');
+    eq(lastHeartbeat('x\n  [2026-09-28 04:05:06] 缩进的心跳\n'), { at: '2026-09-28T04:05:06Z', line: 2, text: '[2026-09-28 04:05:06] 缩进的心跳' }, '容忍前导空格');
+  }
+
   // 关键：护栏必须**看得见**这些目录，否则等于没保护。
   // 我第一版用 /^(\.git|...)/ 前缀匹配，`.github/` 被 `\.git` 前缀吃掉整个跳过
   // ——用来堵洞的护栏自己漏掉了 CI 流水线目录，正是它本该消除的那类盲区。

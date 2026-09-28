@@ -118,6 +118,9 @@
 | `scripts/dispatch-metrics.mjs` | 度量看板：四态分布/严重度/采纳率/闭环时长/数据质量，算不出的显式标注 | `node scripts/dispatch-metrics.mjs` `--check` |
 | `scripts/guard-audit.mjs` | 治理契约审计：写白名单精确性、专家只读、无明文密钥、单号三方一致、加固防回退 | `node scripts/guard-audit.mjs --strict` |
 | `scripts/ledger-doctor.mjs` | **派单后自检闭环**：台账结构体检 + 自动修复（锚点错位/缺列/空行断表/重复单号）；watcher 每次派单后自动 `--fix`，CI 用 `--check` | `node scripts/ledger-doctor.mjs --check` |
+| `scripts/lib/whitelist-audit.mjs` | **免评审白名单正向语义审计**：把每条模式在整棵文件树上展开，逐个判定「是否可证为机器生成」；PROTECTED 优先、UNKNOWN 与死规则一律 fail-closed（不依赖任何样例） | 由 `validate` 调用 |
+| `scripts/lib/watchdog.mjs` | **常驻心跳三态判定**：FRESH / STALE / UNKNOWN。UNKNOWN 绝不冒充绿灯——读不到日志、或读到冻结的历史日志，都判「无法评估」而非通过 | 由 `validate` 调用 |
+| `scripts/watchdog.ps1` | **常驻看门狗**（计划任务每 5 分钟）：心跳超 7 分钟或进程不在则重启 watcher；并扫描「日志已宣告但台账查无此号」的悬空序列号，区分在途与作废 | `powershell -File scripts\watchdog.ps1` |
 | `.github/workflows/expert-guardrails.yml` | CI：每次 push/PR 自动跑上述五项，红了不许合并 | 自动 |
 
 **v2 关键修复**（对应 `DSP-20260925-1221/1222/1223` 三笔待签批意见）：
