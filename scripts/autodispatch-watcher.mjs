@@ -244,6 +244,26 @@ export function buildDotPathNotice(files) {
  * 修法：指纹只覆盖**派单执行路径**上的模块（watcher 自身 + scripts/lib/），
  * 改文档、改进其它无关脚本不会触发重启——否则改个 README 就重启一次是噪声。
  *
+ *
+ * ── 覆盖边界：为什么不把 guard-audit / validate / selftest 纳入？ ──
+ * 2026-09-28 expert/18-security 在 DSP-20260928-1149-01 建议把
+ * 「guard-audit.mjs / validate-expert-team.mjs 等安全脚本」纳入指纹覆盖，
+ * 理由是它们改动不触发漂移检测。**该建议已复核，结论是不采纳**，理由如下：
+ *
+ *   本文件**没有任何项目模块的静态或动态 import**（实测：import 段只有 node: 内置模块；
+ *   无 import('./lib/…')；唯一的 pathToFileURL 用于 main 模块判定，不加载业务代码）。
+ *   gate 脚本（selftest / validate / approval-sync / dispatch-metrics）是
+ *   **每轮 spawn 子进程**执行的——每次都从磁盘重新加载，**不存在陈旧**，
+ *   所以它们改了不需要重启，重启了也没有收益。
+ *
+ *   反过来把它们纳入指纹会造成**实质危害**：每改一次门禁脚本就消耗一次重启深度，
+ *   而深度超限的后果正是降级模式（2026-09-27 我已修过一次的那个
+ *   「一天正常改两次代码就把功能用废」的退化）。**为不存在的风险消耗真实的安全余量。**
+ *
+ *   真正会陈旧的只有本文件自身（ESM 启动时载入），以及将来任何被 import 进来的模块。
+ *   若将来新增项目模块 import，**必须同步扩大本函数覆盖**，
+ *   否则会重演「常驻跑旧代码且无任何提示」。selftest §24.10 有断言守住这条边界。
+ *
  * @returns {Promise<string>} sha256 前 16 位；读不到任何文件时返回 ''（不误判为漂移）
  */
 export async function sourceFingerprint(root = ROOT) {
@@ -282,6 +302,23 @@ export const RESTART_CHAIN_RESET_MS = 30 * 60 * 1000;
 export function effectiveDepth(depth, chainAt, now = Date.now()) {
   if (!chainAt || now - chainAt > RESTART_CHAIN_RESET_MS) return 0;
   return depth;
+}
+
+/**
+ * 漂移自检间隔。
+ *
+ * 2026-09-28 加入 `AUTODISPATCH_DRIFT_INTERVAL_MS` 覆盖，**只为让行为测试跑得动**。
+ * 起因：expert/14-qa-governance 在 DSP-20260928-1149-01 指出——
+ * 降级分支此前**运行时覆盖为 0**（冒烟测试因 mock state 导致 `fp===fp0` 早退，
+ * 而 §24.8 的 14 条断言全是对源码字符串的文本匹配，证明不了「跑起来真的不退出」）。
+ * 默认下限 30s 是刻意选的：一个 80 秒的测试进 CI 可以接受，30 秒的轮询间隔不是测试尺度。
+ * 硬下限 1000ms：再小就测的是定时器精度而非降级逻辑。
+ */
+export function driftIntervalMs(intervalSec = 120, env = process.env) {
+  const base = Math.max(30000, Math.min(intervalSec, 300) * 1000);
+  const raw = Number(env.AUTODISPATCH_DRIFT_INTERVAL_MS || 0);
+  if (!raw || !Number.isFinite(raw)) return base;
+  return Math.max(1000, Math.min(raw, base));   // 不得超过生产默认：测试不得让检测变慢
 }
 
 /**
@@ -1255,14 +1292,32 @@ async function main() {
        * 把漂移事实写进状态与日志并每轮重申，等人择机重启。**永不因漂移而停服。**
        */
       degraded = { since: new Date().toISOString(), from: fp0, to: fp, depth: restartDepth };
+      /* ⚠ 这里曾写成 `const r = state.repos[repoKey] = st.repos[repoKey] || {}`——
+       * 赋给了 `state` 而不是刚 load 出来的 `st`。此处 `state` 并非该作用域的变量，
+       * 于是抛 ReferenceError/TypeError，被下面的空 catch 吞掉，
+       * **degraded 从未真正落盘**，而紧跟的日志却宣称「已记入状态 degraded」——
+       * **日志在说谎**。这正是 expert/14-qa-governance 在 DSP-20260928-1149-01
+       * 指出的「state/st 别名脆弱写法（degraded 字段在边缘时序丢失）」，当时未修。
+       * 2026-09-28 由新增的 §24.9 行为测试**实测暴露**：状态文件里只有 codeFingerprint。
+       * 教训：文本断言（§24.8）证明不了运行时行为；纯函数测试也够不着——
+       * 必须真跑一次进程，才看见这条日志与磁盘的分离。
+       */
+      let stateWriteFailed = false;
       try {
         const st = await loadState(flags, { persist: false });
-        const r = state.repos[repoKey] = st.repos[repoKey] || {};
+        const r = (st.repos[repoKey] = st.repos[repoKey] || {});
         r.degraded = degraded;
         await saveState(st, flags);
-      } catch { /* 记状态失败不影响继续服务 */ }
+      } catch (e) {
+        // 记状态失败**不影响继续服务**（降级优先于留痕），但绝不能静默：
+        // 空 catch 会把「留痕失败」伪装成「已留痕」。
+        stateWriteFailed = true;
+        log(`    [!] degraded 写入状态失败（不影响服务，但该事实只存在于本条日志）：${e.message}`);
+      }
       log('⚠ 短时间内已自重启 ' + restartDepth + ' 次仍检出漂移 → **进入降级模式：继续用旧代码服务，不停机**。');
-      log('    旧代码功能完整，只是提示词与纪律略旧；漂移事实已记入状态 `degraded` 并每轮重申。');
+      log(stateWriteFailed
+        ? '    旧代码功能完整，只是提示词与纪律略旧；**注意：degraded 未能写入状态文件，仅见本条与后续重申日志**。'
+        : '    旧代码功能完整，只是提示词与纪律略旧；漂移事实已记入状态 `degraded` 并每轮重申。');
       log('    请在代码改动告一段落后手动重启常驻（Stop-ScheduledTask → 杀残留 node → Start-ScheduledTask）。');
       log('    **设计更正**：此处曾 exit 75，结果服务静默消失 14 小时而无任何告警——');
       log('    「不重启」不等于「安全」，它等于「没有服务」。循环风险来自 spawn，不来自继续运行。');
@@ -1277,7 +1332,7 @@ async function main() {
     log(`    已自重启：新进程 pid=${pid}（深度 ${restartDepth + 1}/${MAX_RESTART_DEPTH}，延迟 3s 启动以避开锁竞态），本进程以 ${EXIT_CODE_STALE} 退出。`);
     log('    注：不依赖计划任务的 -RestartCount——实测那条路径 7 分钟内无任何反应。');
     process.exit(EXIT_CODE_STALE);
-  }, Math.max(30000, Math.min(flags.interval, 300) * 1000));
+  }, driftIntervalMs(flags.interval));
   driftTimer.unref?.();
 
   await runOnce();

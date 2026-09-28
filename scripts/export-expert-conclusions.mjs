@@ -99,6 +99,13 @@ const extractBlocks = (t) => {
   return out;
 };
 
+/* ── 结论块有效性判定已移至 scripts/lib/conclusion-audit.mjs ──
+ * 2026-09-28 因 DSP-20260928-1213-01 复核踩到「假原文」而加，详见该文件。
+ * 放在 lib/ 是为了让 selftest 能直接 import 测它——
+ * 否则又是一条「没被测过的护栏」，正是本体系反复栽的跟头。
+ */
+import { partitionBlocks } from './lib/conclusion-audit.mjs';
+
 async function main() {
   const cli = cliPath();
   const { stdout: raw } = await exec(cli, ['api', 'get', '/api/session?limit=100'], { maxBuffer: 64e6 });
@@ -118,7 +125,7 @@ async function main() {
 
   const report = [];
   const json = { main: { id: main.id, title: main.title }, experts: [] };
-  let blocks = 0, gates = 0, flags = 0, missing = 0, benign = 0;
+  let blocks = 0, gates = 0, flags = 0, missing = 0, benign = 0, templates = 0;
 
   report.push(`# 专家结论原文导出`);
   report.push('');
@@ -149,19 +156,25 @@ async function main() {
     const texts = walkTexts(data);
     const own = texts.filter((t) => !t.startsWith('You are a subagent'));   // 排除提示词模板
     const promptHit = /点路径清单|git ls-files/.test(texts.join('\n'));    // 点路径纪律是否透传到该子会话
-    const bs = [];
-    for (const t of own) for (const b of extractBlocks(t)) if (b.length < 8000) bs.push(b);
-    // 去重（同一结论可能在多条消息里重复）
-    const uniq = [...new Set(bs)];
+    const cands = [];
+    for (const t of own) for (const b of extractBlocks(t)) cands.push(b);
+    const { real: uniq, bogus: bogusUniq } = partitionBlocks(cands);
     blocks += uniq.length;
+    templates += bogusUniq.length;
 
     rec.promptHasDotPathRule = promptHit;
-    rec.blocks = uniq;
+    rec.blocks = uniq;                     // 真结论：保持原语义，不混入伪块
+    rec.nonConclusionBlocks = bogusUniq.map((x) => ({ why: x.why, head: x.b.slice(0, 80) }));
 
     report.push(`## ${k.id}　${k.title || ''}`);
     report.push('');
     report.push(`- 文本片段 ${texts.length} 段（自身产出 ${own.length} 段）`);
     report.push(`- 结论块 ${uniq.length} 个${promptHit ? '　✅ 子会话提示词含点路径纪律（说明脚本注入已透传）' : ''}`);
+    if (bogusUniq.length) {
+      report.push(`- ⚠ 另有 **${bogusUniq.length}** 段带 \`<!--结论\` 标记但**不符合结论块契约**，`
+        + `已标注不计入结论块（否则会导出**假原文**。2026-09-28 修复）：`);
+      for (const x of bogusUniq) report.push(`    · ${x.why}　片段开头：「${x.b.slice(0, 60).replace(/\n/g, ' ')}」`);
+    }
     report.push('');
 
     if (!uniq.length) {
@@ -197,6 +210,10 @@ async function main() {
   report.push('## 汇总');
   report.push('');
   report.push(`- 专家子会话：${kids.length}　结论块：${blocks}　含门禁判定：${gates}`);
+  if (templates) {
+    report.push(`- **非结论块（带 \`<!--结论\` 标记但缺契约必填字段）共 ${templates} 段**，已标注排除。`
+      + `不报数就会把「少了一段」伪装成「本来就那么多」——那与假原文是同一个错误的两个方向`);
+  }
   report.push(`- 标记：${flags}　其中**疑似引述**（专家在转述被拒的注入）：${benign}　真正待判读：${flags - benign}　导出失败：${missing}`);
   report.push('');
   report.push('> **本工具只摆证据、不下合规结论。**「疑似引述」是启发式（看命中词附近有没有引用标记或转述动词），');

@@ -4,7 +4,7 @@
  * 覆盖 watcher v2 的纯函数与状态机不变量——对应 DSP-20260925-1221 提出的
  * 「无测试证据、不可常驻启用」意见。这些断言可在 CI 无模型环境运行。
  */
-import { mkdtemp, mkdir, readFile, writeFile, rm, stat, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, stat, readdir, copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -17,11 +17,12 @@ import {
   REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
   buildSerialNotice, runCli, splitExempt, countDispatchRows, sourceFingerprint, EXIT_CODE_STALE, MAX_RESTART_DEPTH,
-  effectiveDepth, RESTART_CHAIN_RESET_MS,
+  effectiveDepth, RESTART_CHAIN_RESET_MS, driftIntervalMs,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict, parseSerial } from './lib/runbook.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
+import { partitionBlocks, missingFields, isRealConclusion, placeholderFieldCount } from './lib/conclusion-audit.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
 import { matchPathRules, buildDotPathNotice } from './autodispatch-watcher.mjs';
 import { globSync, existsSync } from 'node:fs';
@@ -792,8 +793,64 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     truthy(!/Where-Object \{ \$_\.CommandLine -match 'run --agent' \} \|/.test(wd), '不存在「只按 run --agent 杀」的无差别写法');
   }
 
-  // 关键：护栏必须**看得见**这些目录，否则等于没保护。
-  // 我第一版用 /^(\.git|...)/ 前缀匹配，`.github/` 被 `\.git` 前缀吃掉整个跳过
+  // 22.9 结论块有效性判定（2026-09-28，因 DSP-20260928-1213-01 复核拿到「假原文」而加）
+  //
+  // 缺陷实况：export-expert-conclusions.mjs 的 extractBlocks 只认 `<!--结论` 标记，
+  // 而该字样会出现在被引用的契约模板、JS 源码字符串、文档示例里。实测 1213-01 的 R 子会话
+  // 里一个 `<!--结论'` 落在 validate 源码中，取到的「块」横跨数百行代码。
+  // **假原文比取不到原文更坏**：取不到会显式报缺失，假原文会被当成专家真话引用进核对台账。
+  //
+  // 我第一版用占位符黑名单，实测**没匹配上**——污染源是代码字符串，里面没有那些占位符。
+  // 黑名单只能挡住预想到的污染，故改为正向判定：缺契约必填字段即非结论块。
+  {
+    const REAL = '<!--结论\n事项: 评审 commit abc · 某变更\nR: expert/16-devops-sre\n'
+      + 'C: expert/18-security\n四态: 有条件通过\n严重度: 中\n依据: scripts/x.mjs:1-2\n'
+      + '风险: 一句话\n行动: 动作=做一件事; 责任人=expert/16-devops-sre; 时限=合并前\n'
+      + '升级对象: 无\n数据缺失: 无\n-->';
+    // 真实的污染形态：`<!--结论'` 出现在 JS 源码字符串里，取到的块横跨数百行代码
+    const CODE = "<!--结论')) miss.push('缺结论块契约');\n"
+      + "318:   if (!c.includes('## 权威口径')) miss.push('缺权威口径段');\n".repeat(30)
+      + '`codeFingerprint`\n'
+      + "    ['scripts/lib/whitelist-audit.mjs', /正向/, '白名单审计'],\n-->";
+    // 专家回抄契约模板但没填（退化块）——必须被标出，不能冒充真结论
+    const TEMPLATE = '<!--结论\n事项: ...\nR: expert/xx\nC: ...\n四态: ...\n严重度: ...\n'
+      + '依据: ...\n风险: ...\n行动: ...\n升级对象: ...\n数据缺失: ...\n-->';
+
+    truthy(isRealConclusion(REAL), '符合契约的块判为真结论');
+    eq(missingFields(REAL), [], '真结论无缺失字段');
+
+    truthy(!isRealConclusion(CODE), '横跨数百行源码的「结论块」判为非结论（这正是 1213-01 的实际污染）');
+    truthy(/四态|严重度|行动|升级对象/.test(missingFields(CODE).join('/')), '  └ 缺失字段被如实报出');
+
+    truthy(!isRealConclusion(TEMPLATE), '回抄契约模板未填的退化块判为非结论（字段名齐全但值是 ...）');
+    truthy(placeholderFieldCount(TEMPLATE) >= 2, '  └ 占位值计数能识别回抄未填');
+    eq(placeholderFieldCount(REAL), 0, '真结论的占位值计数为 0');
+    // 关键：字段齐全 ≠ 填了内容。两者是不同的失效，缺一不可
+    truthy(
+      missingFields(TEMPLATE).length === 0 && !isRealConclusion(TEMPLATE),
+      '**不变量**：四个必填字段名齐全但值为占位符 → 仍判非结论（第一版只查字段名，被本条测出漏洞）',
+    );
+    // 真实结论里 严重度 可以是「—」，不得误判为占位
+    const DASH = REAL.replace('严重度: 中', '严重度: —');
+    truthy(isRealConclusion(DASH), '「严重度: —」是合法取值（1213-01 实际出现过），不得当占位符');
+    truthy(!isRealConclusion(''), '空串判为非结论');
+    truthy(!isRealConclusion(null), 'null 判为非结论');
+    truthy(!isRealConclusion(undefined), 'undefined 判为非结论');
+
+    const p = partitionBlocks([REAL, CODE, TEMPLATE, REAL]);
+    eq(p.real.length, 1, 'partitionBlocks 只留 1 个真结论（重复的真结论去重）');
+    eq(p.bogus.length, 2, '2 个非结论块被标出且**未被丢弃**');
+    truthy(p.bogus.every((x) => x.why && x.b), '每个非结论块都带判定理由与原文（不静默丢弃）');
+    truthy(p.bogus.some((x) => /缺契约必填字段/.test(x.why)), '  └ 理由为「缺契约必填字段」而非泛泛的「无效」');
+    eq(partitionBlocks([]).real.length, 0, '空输入返回空真结论');
+    eq(partitionBlocks([REAL.repeat(50)]).bogus.length, 1, '超长块（疑似跨块误切）被标出');
+
+    // 关键不变量：非结论块绝不能混进 real
+    const mixed = partitionBlocks([REAL, CODE, TEMPLATE, 'x', REAL, CODE]);
+    truthy(mixed.real.every((b) => isRealConclusion(b)), '**不变量**：real 里绝不混入非结论块（否则又是假原文）');
+  }
+
+  // 关键：护栏必须**看得见**这些目录，否则等于没保护。  // 我第一版用 /^(\.git|...)/ 前缀匹配，`.github/` 被 `\.git` 前缀吃掉整个跳过
   // ——用来堵洞的护栏自己漏掉了 CI 流水线目录，正是它本该消除的那类盲区。
   for (const must of ['.github/workflows/expert-guardrails.yml', 'scripts/autodispatch-watcher.mjs',
     'scripts/lib/runbook.mjs', '.opencode/agents/router.md', 'docs/expert-team/runbook/审批记录.md',
@@ -902,6 +959,146 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
     // 每轮重申，否则「降级」与「正常」在日志里无异 = 变相静默
     truthy(/仍在降级模式/.test(m2), '降级状态每轮重申（防变相静默）');
     truthy(/degraded = null/.test(m2), '漂移消失后可退出降级（degraded 可复位）');
+  }
+
+  // 24.9 降级分支**行为测试**（2026-09-28，因 expert/14-qa-governance 在 1149-01 的
+  // 指认而加——「该分支运行时覆盖为 0」）
+  //
+  // 专家的批评原文：24.8 的 12 条断言「均为源码文本正则，无运行时验证」，
+  // 而 24.5 冒烟「全程 mock state，fp===fp0 早退」，所以
+  // 「该分支若因重构变为间接退出或抛异常崩溃，现有测试全绿而服务再次静默消失」。
+  // **这个批评成立**：24.8 证明的是「代码里写了『不退出』这几个字」，
+  // 不是「跑起来真的不退出」。下面这条才是后者。
+  //
+  // 做法：把 watcher 与一个 lib 文件复制到临时目录（ROOT 由 __dirname 推导，故天然隔离），
+  // 用 AUTODISPATCH_RESTART_DEPTH=2 把深度顶到上限、链起点设为当前时刻（不冷却），
+  // 再把漂移间隔压到 1.2s（新增的 AUTODISPATCH_DRIFT_INTERVAL_MS，仅测试用），
+  // 然后**改动 lib 文件使指纹变化**，等漂移定时器 tick，断言：
+  //   ① 进程仍存活（没有 exit）
+  //   ② 日志出现「进入降级模式」
+  //   ③ 状态文件里 degraded 被写入（可事后审计，不只打日志）
+  //   ④ 轮询仍在继续（降级没有把 timer 停掉——这正是我修漏过一次的地方）
+  {
+    truthy(typeof driftIntervalMs === 'function', 'driftIntervalMs 已导出（测试需压低漂移间隔）');
+    // 注意语义：原式是 max(30s 下限, min(interval,300)s)，**30s 是下限不是取值**。
+    // 我第一版把 --interval 120 的漂移间隔当成 30s 写进断言，被当场测出是 120s。
+    eq(driftIntervalMs(5, {}), 30000, 'interval 5s 时取 30s 下限');
+    eq(driftIntervalMs(120, {}), 120000, '生产 interval 120s → 漂移检测 120s（**不是 30s**）');
+    eq(driftIntervalMs(300, {}), 300000, 'interval 300s 时漂移检测 300s');
+    eq(driftIntervalMs(120, { AUTODISPATCH_DRIFT_INTERVAL_MS: '1200' }), 1200, 'env 可压低到 1.2s（测试用）');
+    eq(driftIntervalMs(120, { AUTODISPATCH_DRIFT_INTERVAL_MS: '10' }), 1000, 'env 有 1000ms 硬下限');
+    eq(driftIntervalMs(120, { AUTODISPATCH_DRIFT_INTERVAL_MS: '999999' }), 120000, 'env **不得超过**生产默认（测试不得让检测变慢）');
+    eq(driftIntervalMs(120, { AUTODISPATCH_DRIFT_INTERVAL_MS: 'abc' }), 120000, 'env 非法值退回默认，不猜');
+
+    // ── 真跑：临时目录里起一个常驻 watcher，制造漂移 ──
+    // 必须是真 git 仓库：非 git 目录下轮询直接「跳过」，就没有 poll 日志可证「轮询仍在继续」。
+    const bdir = join(tmp, 'degrade-behaviour');
+    await mkdir(join(bdir, 'scripts', 'lib'), { recursive: true });
+    await copyFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), join(bdir, 'scripts', 'autodispatch-watcher.mjs'));
+    // 源指纹只覆盖 watcher + scripts/lib/*.mjs，故必须有这个 lib 文件才改得动指纹
+    const libFile = join(bdir, 'scripts', 'lib', 'probe.mjs');
+    await writeFile(libFile, 'export const V = 1;\n', 'utf8');
+    const bstate = join(bdir, 'state.json');
+    const bLog = join(bdir, 'out.log');
+    // 注意：git 助手签名是 git(dir, args)，**args 是数组**（内部展开成 -C dir ...args）。
+    // 我连错两次：先写成 git(args,{cwd}) → TypeError；再写成 git(dir,...args) → 字符串被展开成字符。
+    await git(bdir, ['init', '-q']);
+    await git(bdir, ['config', 'user.email', 't@t']);
+    await git(bdir, ['config', 'user.name', 't']);
+    await git(bdir, ['add', '-A']);
+    await git(bdir, ['commit', '-q', '-m', 'init']);
+
+    const run = await new Promise((resolve) => {
+      const out = [];
+      const p = spawn(process.execPath,
+        [join(bdir, 'scripts', 'autodispatch-watcher.mjs'), '--interval', '2', '--state', bstate],
+        {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+          env: {
+            ...process.env,
+            AUTODISPATCH_RESTART_DEPTH: '2',                     // 顶到上限 → 应走降级而非重启
+            AUTODISPATCH_RESTART_CHAIN_AT: String(Date.now()),    // 链未冷却 → 深度不被归零
+            AUTODISPATCH_DRIFT_INTERVAL_MS: '1200',
+          },
+        });
+      p.stdout.on('data', (d) => out.push(String(d)));
+      p.stderr.on('data', (d) => out.push('\nSTDERR:' + d));
+      let exited = null;
+      p.on('close', (code) => { exited = code; });
+      // 起来之后改动 lib 文件 → 指纹变化 → 漂移定时器应检测到并进入降级
+      setTimeout(() => { writeFile(libFile, 'export const V = 2;\n', 'utf8').catch(() => {}); }, 1600);
+      // 给足时间：至少 2 次漂移 tick（验证「每轮重申」也真的在跑）
+      const killer = setTimeout(() => { try { p.kill(); } catch { /* 已退出 */ } }, 5200);
+      p.on('close', () => { clearTimeout(killer); resolve({ text: out.join(''), earlyExit: exited }); });
+    });
+    await writeFile(bLog, run.text, 'utf8');
+
+    truthy(/源码指纹/.test(run.text), '24.9 前置：临时目录的常驻确实起来了（打了源码指纹）');
+    truthy(/检测到源码漂移/.test(run.text), '24.9：改动 lib 文件后确实检出了源码漂移（否则下面全是空断言）');
+    truthy(/进入降级模式/.test(run.text), '24.9 **行为**：深度超限时进入降级模式，而不是 exit 75');
+    truthy(!/不再重启/.test(run.text), '24.9 行为：未出现「不再重启」——该措辞对应旧的停服行为');
+    truthy(run.earlyExit === null, '24.9 **行为**：进程在漂移后仍存活，未退出（这正是 14 小时事故的直接形态）');
+    truthy(!/STDERR:/.test(run.text), '24.9 行为：降级过程无 stderr（不崩）');
+    // 每轮重申：漂移定时器至少 tick 了两次，第二次应打出重申行
+    const reShout = (run.text.match(/仍在降级模式/g) || []).length;
+    truthy(reShout >= 1, `24.9 行为：降级状态每轮重申（实测重申 ${reShout} 次，防变相静默）`);
+    // 轮询仍在继续：降级不得停掉 poll timer
+    const pollLines = (run.text.match(/poll done|首次运行|基线已建立/g) || []).length;
+    truthy(pollLines >= 2,
+      `24.9 行为：轮询在漂移后仍在继续（实测 ${pollLines} 条 poll 日志；我曾把 stopping/clearInterval 放在深度检查之前，修漏过一次）`);
+    // degraded 落进状态文件 → 可事后审计，不只打日志
+    // 这条断言直接抓到了一个真 bug：曾把结果赋给 state 而非 st，抛错被空 catch 吞掉，
+    // 于是日志宣称「已记入状态」而磁盘上根本没有 degraded（2026-09-28 实测）。
+    let stateTxt = '';
+    try { stateTxt = String(await readFile(bstate, 'utf8')); } catch { /* 未生成则断言失败 */ }
+    truthy(/"degraded"/.test(stateTxt), '24.9 行为：degraded 真写进了状态文件（可事后审计，不只打日志）');
+    truthy(/"to"/.test(stateTxt) && /"from"/.test(stateTxt), '  └ 降级记录含漂移前后指纹 from/to（否则无法定位是哪次漂移）');
+    truthy(!/未能写入状态文件/.test(run.text), '24.9 行为：本次未出现「degraded 写入失败」告警（失败时日志会明说）');
+  }
+
+  // 24.10 指纹覆盖边界（2026-09-28，因 expert/18-security 在 1149-01 的建议而复核）
+  //
+  // 专家建议：把 guard-audit.mjs / validate-expert-team.mjs 等「安全脚本」纳入
+  // sourceFingerprint 覆盖，理由是它们改动不触发漂移检测。**复核结论是不采纳。**
+  //
+  // 依据（实测，不是推理）：watcher 的 import 段只有 node: 内置模块，
+  // **没有任何项目模块的静态或动态 import**；gate 脚本全是每轮 spawn 子进程执行，
+  // 每次从磁盘重新加载 → **不存在陈旧**，改了不需要重启。
+  // 反过来纳入会让每改一次门禁脚本就消耗一次重启深度，而深度超限的后果正是降级模式
+  // ——为不存在的风险消耗真实的安全余量。
+  //
+  // 断言的作用是**双向**的：
+  //   ① 提醒：真出现项目模块 import 时，指纹必须同步扩大（否则常驻跑旧代码且无提示）；
+  //   ② 阻止：有人「顺手」把 subprocess 脚本加进指纹，白白烧掉重启深度。
+  {
+    const w2 = w;
+    // ⚠ 必须先剥注释再判定：我在 sourceFingerprint 的 JSDoc 里**举例写了**
+    // `import('./lib/…')` 这段文字，不剥注释的话这条断言会匹配到**我自己的说明文档**
+    // 而误报「存在动态 import」。第一版就踩了这个坑，当场失败。
+    const codeOnly = w2.split(/\r?\n/)
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n');
+    const importLines = codeOnly.split(/\r?\n/).filter((l) => /^\s*import\b/.test(l));
+    const projectImports = importLines.filter((l) => /from\s+'\.\.?\//.test(l));
+    eq(projectImports.length, 0,
+      'watcher 没有任何项目模块的静态 import（故只有它自身会 ESM 陈旧）——若此断言失败，指纹覆盖必须同步扩大');
+    truthy(!/import\(\s*['"]\.\.?\//.test(codeOnly), '也没有项目模块的动态 import（已剥注释，避免匹配到说明文档本身）');
+    truthy(/pathToFileURL/.test(w2), 'pathToFileURL 仅用于 main 模块判定（不是加载业务代码）');
+
+    // gate 脚本确实是 spawn 子进程跑的——这正是它们不会陈旧的根据
+    for (const g of ['selftest.mjs', 'validate-expert-team.mjs', 'approval-sync.mjs', 'dispatch-metrics.mjs']) {
+      truthy(w2.indexOf(g) >= 0, `gate 脚本 ${g} 出现在常驻的调用面里（作为子进程，故不需重启）`);
+    }
+
+    // 指纹实现仍只覆盖 watcher 自身 + scripts/lib/*.mjs
+    const fpAt = w2.indexOf('export async function sourceFingerprint');
+    const fpFn = w2.slice(fpAt, fpAt + 700);
+    truthy(/autodispatch-watcher\.mjs/.test(fpFn), '指纹覆盖 watcher 自身');
+    truthy(/'lib'/.test(fpFn), '指纹覆盖 scripts/lib/*.mjs');
+    truthy(!/guard-audit\.mjs|validate-expert-team\.mjs|selftest\.mjs/.test(fpFn),
+      '指纹**未**纳入子进程型 gate 脚本（纳入会白白消耗重启深度，为不存在的风险烧安全余量）');
+    truthy(/覆盖边界/.test(w2), '代码里写明了「为什么不纳入」及其依据（防止后来者盲目照做专家建议）');
   }
   truthy(/检测到源码漂移/.test(w), '有明确的漂移告警文案');
   truthy(/仍跑启动时载入的旧代码/.test(w), '告警点明「仍跑旧代码」这个真实后果');
@@ -1090,12 +1287,23 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
   dRecs.forEach((d, i) => {
     if (!VERDICTS.includes(d.verdict) && d.verdict !== null) valIssues.push(`${d.dsp ? d.dsp.id : '?'}: 结论摘要解析出越界四态「${d.verdict}」`);
     if (!d.humanA) valIssues.push(`${d.dsp ? d.dsp.id : '?'}: 人类A 为空`);
-    // R 列：正常评审行必须有 R；但**幂等跳过行**（router 识别到提交已评审、未重复派单）
-    // 的 R/C/派发如实写「—」是正确的，不该判违规。
-    // 我第一版一刀切要求 R，把 3 条幂等跳过行误判为异常——**误报同样是缺陷**。
-    const isSkip = /幂等跳过/.test(book.dispatchTable.rows[i][7] || '');
-    if (!isSkip && (!d.R || !/路由Agent|expert\/[a-z0-9-]+/.test(d.R))) {
-      valIssues.push(`${d.dsp ? d.dsp.id : '?'}: 非幂等跳过行的 R 列异常「${d.R}」`);
+    // R 列：正常评审行必须有 R；但有两类行**如实写「—」是正确的**，不该判违规：
+    //   ① **幂等跳过行**（router 识别到提交已评审、未重复派单）
+    //   ② **作废行**（2026-09-28 新增）：序列号已在 watcher.log 宣告「已派单」，
+    //      但派单台账自始至终无对应行——即**没有任何专家产出过结论**。
+    //      此时 R/C/派发只能是「—」。填一个看似合理的专家 ID 反而是**伪造**：
+    //      那等于宣称「某位专家评审了根本没人评审过的东西」。
+    // 我第一版一刀切要求 R，把 3 条幂等跳过行误判为异常；后来又对 7 条作废行再犯一次
+    // ——**误报同样是缺陷**：它逼着人去编数据来让检查变绿。
+    const raw7 = book.dispatchTable.rows[i][7] || '';
+    const isSkip = /幂等跳过/.test(raw7);
+    const isVoid = /作废/.test(raw7);
+    if (!isSkip && !isVoid && (!d.R || !/路由Agent|expert\/[a-z0-9-]+/.test(d.R))) {
+      valIssues.push(`${d.dsp ? d.dsp.id : '?'}: 非「幂等跳过」也非「作废」的行（R 列异常「${d.R}」）`);
+    }
+    // 作废行必须显式写明「未产生有效结论」，否则「R 为空」会变成一条可被随手填的绕过路径
+    if (isVoid && !/未产生有效结论/.test(raw7)) {
+      valIssues.push(`${d.dsp ? d.dsp.id : '?'}: 作废行必须写明「未产生有效结论」（否则 R 为空可被当作绕过口）`);
     }
   });
   // (4) 跨表连接键：AP 与 DSP 的尾号必须一致（台账「单号规则」明确要求一一对应）
