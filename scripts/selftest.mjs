@@ -1024,13 +1024,34 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
         });
       p.stdout.on('data', (d) => out.push(String(d)));
       p.stderr.on('data', (d) => out.push('\nSTDERR:' + d));
-      let exited = null;
-      p.on('close', (code) => { exited = code; });
+      /* ⚠ 断言「进程未自行退出」的正确写法，2026-09-28 被 CI 教了一次。
+       *
+       * 我原来写的是 `p.on('close', code => exited = code)` 然后断言 `exited === null`。
+       * **这是错的，而且本地是「因为错误的理由而通过」**：
+       *   · Windows 上 `child.kill()` 走 TerminateProcess，close 事件带上来的是 null
+       *     → 我以为「没退出」，其实那只是「被杀时退出码为 null」；
+       *   · Linux 上 `child.kill()` 发 SIGTERM，watcher 的 SIGTERM 处理器**优雅退出**并
+       *     `process.exit(0)` → close code = 0 → 断言失败。
+       * 换句话说：同一个断言在两个平台测的是**两件不同的事**，而本地那次是假通过。
+       * 只有 ubuntu/node 22 的 CI 才把它暴露出来——**本地全绿不等于验证过**。
+       *
+       * 正确写法：记录「我自己动手杀的时刻」，再断言进程**在此之前没有 close 过**。
+       * 这样与平台无关：进程只能在我要求它退出之后才退出。
+       */
+      let closedAt = null;
+      p.on('close', () => { if (closedAt === null) closedAt = Date.now(); });
       // 起来之后改动 lib 文件 → 指纹变化 → 漂移定时器应检测到并进入降级
       setTimeout(() => { writeFile(libFile, 'export const V = 2;\n', 'utf8').catch(() => {}); }, 1600);
       // 给足时间：至少 2 次漂移 tick（验证「每轮重申」也真的在跑）
-      const killer = setTimeout(() => { try { p.kill(); } catch { /* 已退出 */ } }, 5200);
-      p.on('close', () => { clearTimeout(killer); resolve({ text: out.join(''), earlyExit: exited }); });
+      let killedAt = null;
+      let aliveBeforeKill = false;
+      const killer = setTimeout(() => {
+        // 直接取「动手前它是否还活着」，比事后比对退出码更硬
+        aliveBeforeKill = p.exitCode === null && p.signalCode === null && closedAt === null;
+        killedAt = Date.now();
+        try { p.kill(); } catch { /* 已退出 */ }
+      }, 5200);
+      p.on('close', () => { clearTimeout(killer); resolve({ text: out.join(''), closedAt, killedAt, aliveBeforeKill }); });
     });
     await writeFile(bLog, run.text, 'utf8');
 
@@ -1038,7 +1059,12 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
     truthy(/检测到源码漂移/.test(run.text), '24.9：改动 lib 文件后确实检出了源码漂移（否则下面全是空断言）');
     truthy(/进入降级模式/.test(run.text), '24.9 **行为**：深度超限时进入降级模式，而不是 exit 75');
     truthy(!/不再重启/.test(run.text), '24.9 行为：未出现「不再重启」——该措辞对应旧的停服行为');
-    truthy(run.earlyExit === null, '24.9 **行为**：进程在漂移后仍存活，未退出（这正是 14 小时事故的直接形态）');
+    truthy(run.closedAt === null || run.closedAt >= run.killedAt,
+      '24.9 **行为**：进程在漂移后仍存活、我动手杀它之后才退出（平台无关；'
+      + 'Windows 的 kill 退出码为 null、Linux 的 SIGTERM 走优雅退出 exit 0，'
+      + '故不能拿退出码判「是否自行退出」——本地那次就是假通过）');
+    truthy(run.aliveBeforeKill,
+      '24.9 **行为**：动手 kill 的那一刻进程仍活着（exitCode/signalCode 均为 null 且尚未 close）');
     truthy(!/STDERR:/.test(run.text), '24.9 行为：降级过程无 stderr（不崩）');
     // 每轮重申：漂移定时器至少 tick 了两次，第二次应打出重申行
     const reShout = (run.text.match(/仍在降级模式/g) || []).length;
