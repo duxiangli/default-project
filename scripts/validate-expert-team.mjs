@@ -633,6 +633,16 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
     bad('读不到 runbook/核对记录.md（挂账纪律无从校验）');
   } else {
     const hang = auditHangRows(hangTxt);
+    // ② contradictions：同一子句里既 ✅ 又「未修/挂账」= 自相矛盾。
+    //   ⚠ 我第一版让 lib 返回 contradictions 却在 validate 里**只用了 issues**——
+    //   那个检测等于白写。lib 写了不等于接上了，**接线处最容易漏**。
+    if (hang.contradictions.length === 0) {
+      ok('核对记录子句自相矛盾：0 处（无「既说已闭环又说未修/挂账」的子句）');
+    } else {
+      bad('核对记录有 ' + hang.contradictions.length + ' 处子句自相矛盾（既 ✅ 又「未修/挂账」）：'
+        + hang.contradictions.slice(0, 3).join('；') + (hang.contradictions.length > 3 ? ' …' : '')
+        + '　——多半是整段替换留下的残字，请清理。');
+    }
     if (hang.issues.length === 0) {
       ok('核对记录挂账纪律：' + hang.rows + ' 行中 ' + hang.hangCount + ' 处「未修/挂账」子句均已带 ✅ 闭环标记');
     } else {
