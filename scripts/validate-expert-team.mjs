@@ -5,6 +5,7 @@
  */
 import { readdir, readFile as rawReadFile } from 'node:fs/promises';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
+import { auditHangRows } from './lib/crosscheck-hang.mjs';
 import { judgeHeartbeat, resolveThreshold, VERDICT } from './lib/watchdog.mjs';
 import { execFileSync } from 'node:child_process';
 
@@ -622,6 +623,25 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
     else bad(`双方核对问题: ${crossIssues.slice(0, 4).join('; ')}${crossIssues.length > 4 ? ' …' : ''}`);
   }
 }
+/* 17. 核对记录挂账纪律（2026-09-28）：7 条「未修」实际早已完成，我差点信了那句谎话。
+ * 判定逻辑见 scripts/lib/crosscheck-hang.mjs（按子句而非字符距离——子句才是语义单元）。
+ * 本节只保证「没有无人处理的挂账」；**谎称已闭环它抓不到**，那要靠人核 commit。
+ */
+{
+  const hangTxt = await (async () => { try { return await rawReadFile(path.join(docDir, 'runbook', '核对记录.md'), 'utf8'); } catch { return null; } })();
+  if (hangTxt === null) {
+    bad('读不到 runbook/核对记录.md（挂账纪律无从校验）');
+  } else {
+    const hang = auditHangRows(hangTxt);
+    if (hang.issues.length === 0) {
+      ok('核对记录挂账纪律：' + hang.rows + ' 行中 ' + hang.hangCount + ' 处「未修/挂账」子句均已带 ✅ 闭环标记');
+    } else {
+      bad('核对记录有 ' + hang.issues.length + ' 处「未修/挂账」子句既无 ✅ 闭环标记、也无在办说明：'
+        + hang.issues.slice(0, 3).join('；') + (hang.issues.length > 3 ? ' …' : ''));
+    }
+  }
+}
+
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

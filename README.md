@@ -121,7 +121,7 @@
 | `scripts/lib/whitelist-audit.mjs` | **免评审白名单正向语义审计**：把每条模式在整棵文件树上展开，逐个判定「是否可证为机器生成」；PROTECTED 优先、UNKNOWN 与死规则一律 fail-closed（不依赖任何样例） | 由 `validate` 调用 |
 | `scripts/lib/watchdog.mjs` | **常驻心跳三态判定**：FRESH / STALE / UNKNOWN。UNKNOWN 绝不冒充绿灯——读不到日志、或读到冻结的历史日志，都判「无法评估」而非通过 | 由 `validate` 调用 |
 | `scripts/watchdog.ps1` | **常驻看门狗**（计划任务每 5 分钟）：心跳超 7 分钟或进程不在则重启 watcher；并扫描「日志已宣告但台账查无此号」的悬空序列号，区分在途与作废 | `powershell -File scripts\watchdog.ps1` |
-| `.github/workflows/expert-guardrails.yml` | CI：每次 push/PR 自动跑上述五项，红了不许合并 | 自动 |
+| `.github/workflows/expert-guardrails.yml` | CI：每次 push/PR 自动跑全部确定性检查（体系一致性 / 自动化自测 / 治理契约审计 / 签批闭环 / 度量看板 / 签批超期卡口 / 台账结构体检），红了不许合并。**步数与内容以 `.github/workflows/expert-guardrails.yml` 自报为准**，本表不写死数字 | 自动 |
 
 **v2 关键修复**（对应 `DSP-20260925-1221/1222/1223` 三笔待签批意见）：
 

@@ -23,6 +23,7 @@ import { classifyVerdict, parseSerial } from './lib/runbook.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
 import { partitionBlocks, missingFields, isRealConclusion, placeholderFieldCount } from './lib/conclusion-audit.mjs';
+import { auditHangRows, openHangClauses, contradictoryClauses, DISP_COL } from './lib/crosscheck-hang.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
 import { matchPathRules, buildDotPathNotice } from './autodispatch-watcher.mjs';
 import { globSync, existsSync } from 'node:fs';
@@ -850,6 +851,51 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     truthy(mixed.real.every((b) => isRealConclusion(b)), '**不变量**：real 里绝不混入非结论块（否则又是假原文）');
   }
 
+  // 22.10 核对记录「挂账纪律」判定（2026-09-28，因 7 条「未修」实际早已完成而加）
+  //
+  // 事故：核对记录里 7 条写着「未修/挂账未修/如实挂账」，而这些事早已完成，我差点信了。
+  // 本组断言同时锁住三件踩过的坑：
+  //  ① 列号：处置是第 7 个数据列 → slice(1,-1) 之后索引 6。我第一版写 7（读到「复核者」），
+  //     结果一条挂账都抓不到、还报「0 处全部合规」的空绿灯。**靠插假行反向测试才发现。**
+  //  ② 判据必须是**子句**而非字符距离：1256-01 的 ✅ 与「挂账」分属两子句、相距 40+ 字，
+  //     我先后用过 30 字与 ±24 字两个固定窗口，全都漏报。
+  //  ③ 同一子句里既说「已闭环」又说「挂账」＝自相矛盾，须单列一类报出，
+  //     不能按「✅ 优先」放过——放过矛盾正是本节要消灭的东西。
+  {
+    eq(DISP_COL, 6, '处置列索引 = 6（第 7 个数据列，slice 之后）——写 7 会读到「复核者」列');
+    const mk = (disp) => {
+      const cells = new Array(8).fill('x');
+      cells[0] = 'DSP-20990101-0000-99';
+      cells[DISP_COL] = disp;
+      return '| ' + cells.join(' | ') + ' |\n';
+    };
+    // ⚠ 第一版的 txt 辅助函数默认值自己就含「未修」，于是每次调用都多加一行未闭环数据，
+    //   所有计数断言全错（期望 1 实际 2）。**测试数据里混入被测特征**是经典自伤。
+    const txt = (disp) => mk(disp);
+
+    eq(auditHangRows(txt('① **未修**，等有人跟')).issues.length, 1, '真未闭环 → 报出');
+    eq(auditHangRows(txt('① ✅已闭环（§24.7，闭环于 abc1234）')).issues.length, 0, '已闭环 → 不报');
+    const far = '✅已闭环（selftest §24.7 字段值正确性，6 类全覆盖，CI 每次跑 0 异常；闭环于 3ee5abb'
+      + '，挂账';
+    eq(openHangClauses(far).length, 1, '✅ 与「挂账」分属两子句：按子句仍判为未闭环（固定字符窗口会漏）');
+    eq(auditHangRows(txt(far)).issues.length, 1, '  └ audit 同样报出（不留缝）');
+    eq(contradictoryClauses('② ✅已闭环，但该项**如实挂账**').length, 1, '同子句既 ✅ 又「挂账」→ 判为自相矛盾');
+    eq(openHangClauses('② ✅已闭环，但该项**如实挂账**').length, 0, '  └ 不计入「未闭环」（它是矛盾，不是纯未闭环）');
+    eq(auditHangRows(txt('② ✅已闭环，但该项**如实挂账**')).contradictions.length, 1, '  └ audit 单列 contradictions');
+    eq(auditHangRows('').rows, 0, '空输入 0 行');
+    eq(auditHangRows('| 不是数据行\n').rows, 0, '非数据行不计入');
+    eq(auditHangRows(txt('（无相关字样）一切正常')).hangCount, 0, '无「未修/挂账」字样 → hangCount 0');
+    const r = auditHangRows(txt('① **未修**') + mk('② ✅已闭环'));
+    eq(r.rows, 2, '两行都被计入');
+    eq(r.issues.length, 1, '两行里只有一行未闭环');
+    // 「在给本节命名」而非「在声明一项未闭环」：守卫上线当天我自己的闭环说明里
+    // 出现「第 17 节挂账纪律上线…」而被误报——与 isVoid 曾用裸 /作废/ 被行文骗过同类。
+    eq(openHangClauses('① **已完成并复验**：第 17 节挂账纪律上线，且经反向测试能抓出违规').length, 0,
+      '「挂账纪律」是在给本节命名，不是未闭环断言 → 不误报');
+    eq(openHangClauses('① 第 17 节挂账项已上线；② 该缺陷**未修**').length, 1,
+      '  └ 但同一句里真的「未修」仍被抓到（精确列举，不放宽规则）');
+  }
+
   // 关键：护栏必须**看得见**这些目录，否则等于没保护。  // 我第一版用 /^(\.git|...)/ 前缀匹配，`.github/` 被 `\.git` 前缀吃掉整个跳过
   // ——用来堵洞的护栏自己漏掉了 CI 流水线目录，正是它本该消除的那类盲区。
   for (const must of ['.github/workflows/expert-guardrails.yml', 'scripts/autodispatch-watcher.mjs',
@@ -1323,7 +1369,13 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
     // ——**误报同样是缺陷**：它逼着人去编数据来让检查变绿。
     const raw7 = book.dispatchTable.rows[i][7] || '';
     const isSkip = /幂等跳过/.test(raw7);
-    const isVoid = /作废/.test(raw7);
+    // ⚠ 作废行的识别必须用**精确标记**，不能用裸关键词。
+    //   我原来写 `/作废/.test(raw7)`，结果 DSP-20260928-1402-01 这条**正常完成的派单**
+    //   被误判成作废行——因为它的结论摘要里写了「悬空序列号**作废**行闭合」，
+    //   只是**提到了**这个词。关键词匹配会被行文骗过。
+    //   改用两个精确标记：结论摘要里的加粗 `**作废**`，或明写「未产生有效结论」。
+    //   这与我做免评审白名单护栏时犯的是同一类错：**黑名单/裸关键词挡不住真实形态。**
+    const isVoid = /\*\*作废\*\*/.test(raw7) || /未产生有效结论/.test(raw7);
     if (!isSkip && !isVoid && (!d.R || !/路由Agent|expert\/[a-z0-9-]+/.test(d.R))) {
       valIssues.push(`${d.dsp ? d.dsp.id : '?'}: 非「幂等跳过」也非「作废」的行（R 列异常「${d.R}」）`);
     }
