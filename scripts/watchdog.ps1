@@ -33,7 +33,7 @@ function W($m) {
   Add-Content -Path $log -Value $line -Encoding utf8
 }
 
-# 1) 有没有活着�� watcher 进程
+  # 1) 有没有活着的 watcher 进程
 $procs = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
   Where-Object { $_.CommandLine -match 'autodispatch-watcher' })
 $alive = $procs.Count -gt 0
@@ -104,7 +104,7 @@ if (-not $needRestart) {
   W $msg
   if ($inFlight.Count -gt 0) { W ('    在途 {0} 个序列号已宣告未落台账（正常，子会话收尾时写入）：' -f $inFlight.Count) }
   if ($voided.Count -gt 0) {
-    W ('[!] **{0} 个序列号宣告后超 {1} 分钟仍未落台账，判定丢失/被打断，一律作废**：' -f $voided.Count, [int]($InFlightWindowSec / 60))
+    W ('[!] **{0} 个序列号宣告后超 {1} 分钟仍未落台账，判定丢失/被打断，一律作废**：' -f $voided.Count, [int]$InFlightWindow.TotalMinutes)
     W ('    ' + (($voided | Sort-Object) -join ' '))
   }
   exit 0
@@ -112,7 +112,7 @@ if (-not $needRestart) {
 
 W "[!] 触发重启：$why"
 if ($voided.Count -gt 0) {
-  W ('[!] 下列序列号宣告后超 {0} 分钟仍未落台账（疑被本次重启打断或已丢失），**一律作废**��' -f [int]($InFlightWindowSec / 60))
+  W ('[!] 下列序列号宣告后超 {0} 分钟仍未落台账（疑被本次重启打断或已丢失），**一律作废**：' -f [int]$InFlightWindow.TotalMinutes)
   W ('    ' + (($voided | Sort-Object) -join ' '))
 }
 
@@ -126,9 +126,19 @@ Start-Sleep -Seconds 3
 Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
   Where-Object { $_.CommandLine -match 'autodispatch-watcher' } |
   ForEach-Object { W "  杀 node pid=$($_.ProcessId)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Get-CimInstance Win32_Process -Filter "Name='opencode-cli.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -match 'run --agent' } |
-  ForEach-Object { W "  杀残留 opencode run pid=$($_.ProcessId)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+# 只杀**本仓库**派单产生的残留 opencode 代理进程。
+# 原写法只匹配 'run --agent'，会把本机任何 opencode 代理进程一起杀掉（包括与本仓库无关的）——
+# 这是 DSP-20260928-1213-01 专家指认的「杀进程范围过广」，成立。
+# 现在同时要求命令行含本仓库目录名，并在动手前把命令行记进日志，使该动作可事后审计。
+$repoTag = [System.IO.Path]::GetFileName($Repo)
+$stale = @(Get-CimInstance Win32_Process -Filter "Name='opencode-cli.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -match 'run --agent' -and $_.CommandLine -match [regex]::Escape($repoTag) })
+foreach ($p in $stale) {
+  $cl = $p.CommandLine
+  if ($cl.Length -gt 160) { $cl = $cl.Substring(0, 160) + '…' }
+  W ("  杀残留 opencode run pid=" + $p.ProcessId + " cmd=" + $cl)
+  Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+}
 Start-Sleep -Seconds 2
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 8

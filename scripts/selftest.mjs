@@ -756,6 +756,42 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     eq(lastHeartbeat('x\n  [2026-09-28 04:05:06] 缩进的心跳\n'), { at: '2026-09-28T04:05:06Z', line: 2, text: '[2026-09-28 04:05:06] 缩进的心跳' }, '容忍前导空格');
   }
 
+  // 22.8 watchdog.ps1 静态护栏（2026-09-28，因 DSP-20260928-1213-01 专家实测出真 bug 而加）
+  //
+  // 这组断言对应三个**已被专家在真实评审中指出、且经复核全部成立**的缺陷：
+  //  ① 悬空引用：我把 $InFlightWindowSec 改成 $InFlightWindow（TimeSpan）时漏改日志两处。
+  //     PowerShell 里 $null/60 = 0，**不报错**，于是输出「超 0 分钟」——比崩溃更坏，
+  //     它给出一个看起来正常、实则错误的数字。更糟的是我第一轮把乱码里的 0 误读成 30，
+  //     于是「测试全绿 + 我亲眼看过输出」双双失效。
+  //  ② U+FFFD 乱码：L115 那处正好在字符串收尾，会破坏引号配对。
+  //  ③ 杀进程范围过广：只匹配 'run --agent' 会杀掉本机**任何** opencode 代理进程。
+  //
+  // 为什么必须静态断言：22.7 全是纯函数行为测试，**没有任何一条覆盖 ps1**。
+  // 而 ps1 的失效模式恰好是「不崩、只说错话」，纯函数测试天然看不见。
+  {
+    const wdPath = 'scripts/watchdog.ps1';
+    const wdBuf = await readFile(wdPath);
+    const wd = wdBuf.toString('utf8');
+
+    // ① 悬空引用：出现处数必须与定义处数一致，且不得引用未定义的旧名
+    truthy(!/\$InFlightWindowSec/.test(wd), 'watchdog.ps1 无 $InFlightWindowSec 悬空引用（曾致「超 0 分钟」静默说错）');
+    const defMin = (wd.match(/InFlightWindow\.TotalMinutes/g) || []).length;
+    truthy(defMin >= 2, `TimeSpan 取分钟用 TotalMinutes（${defMin} 处），不用 /60 也不硬编码数字`);
+
+    // ② 编码：U+FFFD 必须是 0；BOM 必须恰好 1 个
+    truthy(!wd.includes('\uFFFD'), 'watchdog.ps1 无 U+FFFD 乱码替换字符');
+    const bom = (wd.match(/\uFEFF/g) || []).length;
+    eq(bom, 1, `UTF-8 BOM 恰好 1 个（实为 ${bom}）——双 BOM 会让 <# 不被识别为块注释，报错指向注释内部`);
+
+    // ③ 杀进程范围：必须同时要求本仓库目录名
+    truthy(/GetFileName\(\$Repo\)/.test(wd), '杀 opencode 残留前先取本仓库目录名做精确匹配');
+    truthy(
+      /CommandLine -match 'run --agent' -and \$_\.CommandLine -match \[regex\]::Escape\(\$repoTag\)/.test(wd),
+      '杀残留同时要求 run --agent 且命令行含本仓库目录名（避免误杀无关 agent 会话）',
+    );
+    truthy(!/Where-Object \{ \$_\.CommandLine -match 'run --agent' \} \|/.test(wd), '不存在「只按 run --agent 杀」的无差别写法');
+  }
+
   // 关键：护栏必须**看得见**这些目录，否则等于没保护。
   // 我第一版用 /^(\.git|...)/ 前缀匹配，`.github/` 被 `\.git` 前缀吃掉整个跳过
   // ——用来堵洞的护栏自己漏掉了 CI 流水线目录，正是它本该消除的那类盲区。
