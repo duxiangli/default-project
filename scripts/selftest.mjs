@@ -798,6 +798,33 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
   // 关键回归：绝不能再依赖 -RestartCount
   truthy(!/交由计划任务重启/.test(w), '漂移日志不再宣称依赖计划任务重启（那句已被实测证伪）');
   truthy(/实测那条路径 7 分钟内无任何反应/.test(w), '代码里保留了「那条路不可靠」的实测记录');
+
+  // 24.8 降级模式：**永不因漂移而停服**（2026-09-27 23:01 实测事故）
+  //
+  // 我原写「深度超限 → 拒绝重启 → exit 75」，以为那是「不循环」与「重启」之间的安全中点。
+  // 实测后果：短时间内第 3 次漂移 → 干净退出 → **此后再无常驻**；而 -RestartCount 实测无效、
+  // 熔断器报 closed/0 失败，于是**服务静默消失 14 小时**，lastHead 落后于 HEAD 而无人发现。
+  // 根因是推理错了：**循环风险来自 spawn，不来自继续运行**。「不重启」不等于「安全」，
+  // 它等于「没有服务」——而没有服务严格更差。
+  {
+    const m2 = w.slice(w.indexOf('const driftTimer = setInterval'));
+    const iDep = m2.indexOf('if (restartDepth >= MAX_RESTART_DEPTH)');
+    const iStop = m2.indexOf('stopping = true;');
+    const iClear = m2.indexOf('clearInterval(timer);');
+    truthy(iDep > 0 && iStop > iDep, 'stopping=true 在深度检查之后（否则降级路径会停掉轮询）');
+    truthy(iClear > iDep, 'clearInterval 在深度检查之后（降级路径必须保留轮询）');
+    const dep = m2.slice(iDep, iStop);
+    truthy(/进入降级模式/.test(dep), '深度超限时进入降级模式');
+    truthy(!/process\.exit/.test(dep), '降级路径不退出（这条是本次事故的核心修复）');
+    truthy(!/release\(\)/.test(dep), '降级路径不释放锁（保持单实例语义）');
+    truthy(!/spawnRestart/.test(dep), '降级路径不 spawn（这正是循环风险的来源，故只在超限时彻底不做）');
+    truthy(/继续用旧代码服务，不停机/.test(dep), '明确写「不停机」');
+    truthy(/degraded/.test(dep), '降级事实写进状态（可事后审计，不只打日志）');
+    truthy(!/已自重启 \$\{restartDepth\} 次仍检出漂移/.test(m2.replace(/^\s*\*.*$/gm, '')), '旧的「不再重启」措辞已从代码移除');
+    // 每轮重申，否则「降级」与「正常」在日志里无异 = 变相静默
+    truthy(/仍在降级模式/.test(m2), '降级状态每轮重申（防变相静默）');
+    truthy(/degraded = null/.test(m2), '漂移消失后可退出降级（degraded 可复位）');
+  }
   truthy(/检测到源码漂移/.test(w), '有明确的漂移告警文案');
   truthy(/仍跑启动时载入的旧代码/.test(w), '告警点明「仍跑旧代码」这个真实后果');
   truthy(/codeFingerprint/.test(w), '指纹落进状态（供 --once 判常驻是否跑旧代码）');

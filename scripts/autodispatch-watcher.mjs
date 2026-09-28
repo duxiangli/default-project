@@ -1216,6 +1216,7 @@ async function main() {
   //   `ReferenceError: stopping is not defined` 把进程打崩，**而 selftest 全绿**
   //   （它只断言了位置顺序、没验运行时有效性）。stderr 里静悄悄，watcher 直接停摆。
   let stopping = false;
+  let degraded = null;   // 降级模式：因短时间内反复漂移而不再自重启，但**继续服务**（见 driftTimer 内注释）
   const fp0 = await sourceFingerprint();
   if (fp0) {
     log(`源码指纹：${fp0}（覆盖 watcher + scripts/lib/；漂移即重启加载新代码）`);
@@ -1231,16 +1232,46 @@ async function main() {
   const driftTimer = setInterval(async () => {
     if (stopping || flags.once) return;
     const fp = await sourceFingerprint();
-    if (!fp || fp === fp0) return;
+    if (!fp || !fp0) return;
+    if (fp === fp0) { degraded = null; return; }
+    // 已降级且漂移未继续变化：仍要定期重申，否则「降级」在日志里与「正常」无异 = 变相静默
+    if (degraded) {
+      const mins = Math.round((Date.now() - new Date(degraded.since).getTime()) / 60000);
+      log(`⚠ 仍在降级模式（已 ${mins} 分钟）：常驻跑的是 ${degraded.from} 的代码，磁盘上已是 ${fp}。服务正常，提示词/纪律略旧。`);
+      return;
+    }
+    log(`[!] **检测到源码漂移**（${fp0} → ${fp}）：本进程仍跑启动时载入的旧代码。`);
+    if (restartDepth >= MAX_RESTART_DEPTH) {
+      /* ⚠ 这里曾写成「拒绝重启并 exit 75」——**那个设计是错的**，2026-09-27 23:01 实测后果：
+       *   短时间内第 3 次漂移 → 打印「不再重启」→ 干净退出 → **此后再无常驻**。
+       *   而计划任务的 -RestartCount 实测无效（7 分钟无反应），熔断器也报 closed/0 失败，
+       *   于是**服务静默消失 14 小时**，而 `lastHead` 落后于 HEAD、未评审提交无人发现。
+       *
+       * 根因是我的推理错了：我以为「拒绝重启」是「不无限循环」与「重启」之间的安全中点。
+       * 实际它把「跑着略旧的代码」变成了「完全没有服务」——**没有服务严格更差**。
+       * 循环风险来自 **spawn**，不来自**继续运行**：不 spawn 就不会有循环。
+       *
+       * 故改为：进入**降级模式继续服务**——保留旧代码继续派单（功能完整，只是提示词/纪律略旧），
+       * 把漂移事实写进状态与日志并每轮重申，等人择机重启。**永不因漂移而停服。**
+       */
+      degraded = { since: new Date().toISOString(), from: fp0, to: fp, depth: restartDepth };
+      try {
+        const st = await loadState(flags, { persist: false });
+        const r = state.repos[repoKey] = st.repos[repoKey] || {};
+        r.degraded = degraded;
+        await saveState(st, flags);
+      } catch { /* 记状态失败不影响继续服务 */ }
+      log('⚠ 短时间内已自重启 ' + restartDepth + ' 次仍检出漂移 → **进入降级模式：继续用旧代码服务，不停机**。');
+      log('    旧代码功能完整，只是提示词与纪律略旧；漂移事实已记入状态 `degraded` 并每轮重申。');
+      log('    请在代码改动告一段落后手动重启常驻（Stop-ScheduledTask → 杀残留 node → Start-ScheduledTask）。');
+      log('    **设计更正**：此处曾 exit 75，结果服务静默消失 14 小时而无任何告警——');
+      log('    「不重启」不等于「安全」，它等于「没有服务」。循环风险来自 spawn，不来自继续运行。');
+      return;                                 // 关键：不退出、不释放锁、不 spawn、**不停止轮询**
+    }
+    // 到这里才决定真正重启：先停轮询与漂移检测，避免与替代进程并行
     stopping = true;
     clearInterval(timer);
     clearInterval(driftTimer);
-    log(`[!] **检测到源码漂移**（${fp0} → ${fp}）：本进程仍跑启动时载入的旧代码。`);
-    if (restartDepth >= MAX_RESTART_DEPTH) {
-      log(`⚠ 短时间内已自重启 ${restartDepth} 次仍检出漂移，**不再重启**（防死循环）。请人工确认代码是否在持续变动，然后手动重启常驻。`);
-      await release();
-      process.exit(EXIT_CODE_STALE);
-    }
     await release();                       // 先放锁，子进程才抢得到
     const pid = spawnRestart(restartDepth, chainAt || Date.now());
     log(`    已自重启：新进程 pid=${pid}（深度 ${restartDepth + 1}/${MAX_RESTART_DEPTH}，延迟 3s 启动以避开锁竞态），本进程以 ${EXIT_CODE_STALE} 退出。`);
