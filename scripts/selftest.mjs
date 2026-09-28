@@ -20,6 +20,7 @@ import {
   effectiveDepth, RESTART_CHAIN_RESET_MS, driftIntervalMs,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict, parseSerial, isBarePlaceholder } from './lib/runbook.mjs';
+import { auditDocAssertions, markersIn, DOC_CHECKS } from './lib/doc-assert.mjs';
 import { hasSignedReview, commitHashesIn, readRunbook } from './lib/runbook.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
@@ -1190,6 +1191,52 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     truthy(/!\(d\.conclusion && traced\) && !idempotentTerminal/.test(w14),
       '  └ 门禁条件为「非(有结论且有留痕)」且「非终态」——两条通路都过才放行');
     truthy(/hasSignedReview/.test(w14), '  └ 门禁实际调用 hasSignedReview（不是自己另写一套）');
+  }
+  // 22.15 文档「可证伪断言」核对（validate 第 20 节，lib/doc-assert.mjs）
+  //
+  // 这个模块要防的不是「文档写错」，而是**自己变成表演性标注**。故断言重点在三条性质：
+  //   ① 标记了但 checkId 未登记 → 必须报红（否则「标了」会被当成「查了」）
+  //   ② 登记了但文档里找不到标记 → 必须报红（否则重写文档后检查静默失效、仍全绿）
+  //   ③ 实跑比对的是**代码里的事实**，不是文档里的措辞
+  // 三条都在真实仓库上做过端到端反向测试（改文档/改源码→报红→还原→回绿），
+  // 本组把关键不变量固化下来，防止以后有人为了「让它变绿」而放松其中一条。
+  {
+    const E22 = String();
+    const MD22 = '| `approval-sync.mjs` | 签批闭环同步 | 写目标有两个 …  <!--核:approval-sync-writes --> |';
+    eq(markersIn(MD22).length, 1, '行尾标记能被抽出');
+    eq(markersIn(MD22)[0], 'approval-sync-writes', '抽出的是 checkId 本身');
+    eq(markersIn('没有标记的行').length, 0, '无标记返回空数组');
+    eq(markersIn('<!--核:-->').length, 0, '空 checkId 不算标记（否则可用来占位刷数量）');
+    eq(markersIn('核:xxx').length, 0, '缺 <!-- 与 --> 的裸文本不算标记');
+    eq(markersIn('<!-- 核 ： spaced-id -->').length, 1, '标记内允许空格与全角冒号');
+    eq(markersIn('<!--核:a--> <!--核:b-->').length, 2, '同一行多个标记都能抽出');
+
+    // 双向完整性是核心：不许只做单向
+    const a22 = await auditDocAssertions(ROOT);
+    eq(a22.violations.length, 0, '真实仓库：文档断言核对 0 违规');
+    // **自证**：扫不到文件或扫不到标记时，「0 违规」不可信
+    truthy(a22.filesScanned > 10, '自证：扫到 ' + a22.filesScanned + ' 个文档（>10）');
+    truthy(a22.marked > 0, '自证：扫到 ' + a22.marked + ' 处标记（>0，否则本节等于没跑）');
+    truthy(a22.checked > 0, '自证：实跑了 ' + a22.checked + ' 项检查');
+    eq(a22.checked, a22.registered, '每项登记的检查都被实跑（无「登记了但不跑」的项）');
+
+    // 登记的 checkId 必须在文档里真实出现（否则就是 orphan）
+    for (const id of Object.keys(DOC_CHECKS)) {
+      truthy(a22.marked >= 1, '登记项 ' + id + ' 有对应标记');
+    }
+
+    // 检查函数本身：必须读代码，且对「事实不符」给出**实测值**而不是只给 ok/不 ok
+    const r22 = await DOC_CHECKS['approval-sync-writes'](ROOT);
+    eq(r22.ok, true, 'approval-sync 写目标检查：当前仓库一致');
+    truthy(/await writeFile/.test(r22.detail) && /\d/.test(r22.detail),
+      '  └ detail 含实测值与期望值（否则报错时人类还得自己重算）');
+
+    // 接线处最容易漏：断言 validate 真的调了它，且带自证
+    const v22 = await readFile(join(ROOT, 'scripts', 'validate-expert-team.mjs'), 'utf8');
+    truthy(/auditDocAssertions/.test(v22), 'validate 确实调用了 auditDocAssertions（lib 写了不等于接上了）');
+    truthy(/marked <= 0/.test(v22), '  └ 对「没扫到任何标记」有自证拒绝放行（防假零）');
+    truthy(/不等于文档已核实/.test(v22), '  └ 输出文案自带边界声明（不得被读成「文档已核实」）');
+    void E22;
   }
 
 

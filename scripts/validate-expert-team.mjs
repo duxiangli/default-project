@@ -7,7 +7,8 @@ import { readdir, readFile as rawReadFile } from 'node:fs/promises';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { auditHangRows } from './lib/crosscheck-hang.mjs';
 import { auditApprovalBasis, viewGeneratedAt, VIEW_FILES } from './lib/approval-basis-audit.mjs';
-import { isBarePlaceholder } from './lib/runbook.mjs';
+import { isBarePlaceholder, commitHashesIn } from './lib/runbook.mjs';
+import { auditDocAssertions } from './lib/doc-assert.mjs';
 import { judgeHeartbeat, resolveThreshold, VERDICT } from './lib/watchdog.mjs';
 import { execFileSync } from 'node:child_process';
 
@@ -743,6 +744,141 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
           + (audit.violations.length > 3 ? ' …' : ''));
       }
     }
+  }
+}
+
+/* 19. 重复派单：同一 commit 被反复排入待签批队列（2026-09-28，人类 A 立项）
+ *
+ * 为什么要有：2026-09-28 实测 commit `6e9416c5` 被派 **32 次**（17:48–22:54 每约 6 分钟一轮），
+ *   并把同一个 commit 排了 **6 次**待签批——等于要人类把同一件事签 6 遍。
+ *   **门禁当时全绿**：每一笔在结构上都是合法派单，没有任何检查会响。
+ *   循环本身已由 watcher 的「幂等终态」判据修掉，但**「同一 commit 入了几次队」这件事
+ *   当时无人统计、无人告警**。只修循环不统计，等于只堵了这一次、下次换个路径复发仍不可见。
+ *
+ * ── 判据为什么是「入队次数」而不是「总派单次数」────────────────────────
+ *   先按「总派单 ≥3」写了一版，一跑就抓到 8 个 commit——**误报太多**。原因是
+ *   多 commit 批次（「4-commit批次（a, b, c, d）」）会让**每个 commit 各计一次**，
+ *   于是正常的一批多提交评审天然就 ≥3。**那不是重复派单，那是批次。**
+ *   真正的危害只有一个：**同一份内容被反复排进队列、反复要人类签字**。
+ *   故判据取「该 commit 关联的**需签批=Y** 的派单行数」。
+ *
+ * ── 阈值 4 的来历（不拍脑袋）──────────────────────────────────────────
+ *   实测本台账的入队次数分布：{0:2, 1:30, 2:9, 3:1, 6:1}。
+ *   次高值是 3（`363f72ea`，2026-09-25 建体系时的三笔种子派单，本就是同一 seed commit 的
+ *   三次独立评审）。**4 把「异常」与「历史最高」清晰地隔开**，且当前只有 6e9416c5 命中。
+ *   若将来某个 commit 真的入队 4 次，那**几乎一定是出问题了**——这个阈值的代价是
+ *   「3 次以内不告警」，如实记下，不假装覆盖。
+ *
+ * ⚠ 与幂等终态的分工：那一条判「这一轮能否推进基线」，本条判「历史上有没有把同一件事
+ *   反复塞给人类」。两者不可互相替代——循环修好后本节对**新**重复仍会报红，这才是价值。
+ */
+{
+  const KNOWN_Q = {
+    '6e9416c5': '2026-09-28 17:48–22:54 被派 32 次、入队 6 次（DSP-20260928-1748/1750/1755/1944/2210/2302-01）；'
+      + '根因已定位并修（幂等终态判据），6 笔按「只签一轮、其余标作重复」处置完毕',
+  };
+  const Q_THRESHOLD = 4;
+  const E19 = String();
+  const dispRows19 = (() => {
+    const src = String(dispatchLogText || E19);
+    const rows = [];
+    const head = src.split('\n').find((l) => l.startsWith('| 派单号') && l.indexOf('事项摘要') >= 0);
+    if (!head) return rows;
+    const h = head.split('|').slice(1, -1).map((x) => x.trim());
+    const iSub = h.findIndex((x) => x.indexOf('事项摘要') >= 0);
+    if (iSub < 0) return rows;
+    for (const l of src.split('\n')) {
+      if (!l.startsWith('| DSP-')) continue;
+      const r = l.split('|').slice(1, -1).map((x) => x.trim());
+      rows.push([String(r[0] || E19), String(r[iSub] || E19), String(r[8] || E19)]);
+    }
+    return rows;
+  })();
+
+  if (dispatchLogText && dispRows19.length === 0) {
+    bad('重复派单检查：派单日志有内容但**切不出数据行**（表头或列名变了），本节结论不可信');
+  } else if (dispRows19.length === 0) {
+    bad('重复派单检查：**一行派单都没读到**，本节结论不可信');
+  } else {
+    const total = new Map();
+    const queued = new Map();
+    let isY = 0;
+    for (const r of dispRows19) {
+      for (const h of commitHashesIn(r[1])) {
+        if (!total.has(h)) { total.set(h, 0); queued.set(h, []); }
+        total.set(h, total.get(h) + 1);
+        if (/^\s*Y\s*$/i.test(r[2])) { queued.get(h).push(r[0]); isY++; }
+      }
+    }
+    // **自证**：一个入队标记都没解析出来时，「无重复」不可信。
+    // 必须报：否则「解析器写坏了」与「没有重复」会输出同一句话——
+    // 本轮已经栽过一次假零（变量名撞车导致每行 continue，却输出「0 处」）。
+    if (isY === 0) {
+      bad('重复派单检查：入队标记（需签批=Y）**一个都没解析出来**，本节结论不可信');
+    } else {
+      const over = [...queued.entries()].filter(([, l]) => l.length >= Q_THRESHOLD)
+        .sort((a, b) => b[1].length - a[1].length);
+      const fresh = over.filter(([h]) => !(h in KNOWN_Q));
+      const known = over.filter(([h]) => h in KNOWN_Q);
+      for (const [h, l] of known) {
+        log(`  ⚠ 已知旧账 ${h}（入队 ${l.length} 次）：${KNOWN_Q[h]}`);
+      }
+      // Top 计数作为信息行输出：让「趋势」可见，而不是只在越线时才说话
+      const top = [...total.entries()].sort((a, b) => b[1] - a[1].length).slice(0, 3)
+        .map(([h, n]) => `${h}×${n}`).join('、');
+      if (fresh.length) {
+        bad('重复入队告警：' + fresh.length + ' 个 commit 被排入待签批队列 ≥' + Q_THRESHOLD + ' 次：'
+          + fresh.slice(0, 3).map(([h, l]) => `${h}×${l.length}（${l.slice(0, 3).join('/')}${l.length > 3 ? '…' : ''}）`).join('；')
+          + (fresh.length > 3 ? ' …' : '')
+          + '　——**同一份内容反复要人类签字**，而每一笔在结构上都是合法派单、门禁当时全绿。'
+          + '查法：`git log --oneline -1 <hash>` 确认该 commit，再看 `logs/watcher.log` 找循环区间；'
+          + '根因通常是「幂等跳过被 fail-closed 判成失败 → 不推进 lastHead → 下一轮又派」。'
+          + `（总派单 Top3：${top}）`);
+      } else {
+        ok('重复入队：' + dispRows19.length + ' 行派单 / ' + total.size + ' 个 commit / 入队标记 ' + isY + ' 处，'
+          + '无「同一 commit 入队 ≥' + Q_THRESHOLD + ' 次」'
+          + (known.length ? `（另有 ${known.length} 个已知旧账已显式列出）` : '')
+          + `。总派单 Top3：${top}`);
+      }
+    }
+  }
+}
+
+
+/* 20. 文档「可证伪断言」核对（2026-09-28，人类 A 立项；实现见 lib/doc-assert.mjs）
+ *
+ * 缺口来源：`06 §7.4` 记录过「文档正文里的事实断言无自动检查」。
+ * 它在 2026-09-28 兑现了两次——`06 §7.1` 的 import 断言（DSP-20260928-1658-01）
+ * 与 `04` 里 approval-sync 的写目标个数（DSP-20260928-1730-01），
+ * **两次都不是靠检查发现的，是靠专家评审发现的**。
+ *
+ * 做法（形式化先于检查，这是 `06 §7.4` 自己写的次序）：
+ *   文档里用行尾标记 `<!--核:<checkId>-->` 指向一个**登记在代码里**的检查；
+ *   检查去**代码**里核对，**绝不拿文档自己证明文档自己**。
+ *
+ * 三条让它不至于变成「表演性标注」的性质（任一失效本节即失去意义）：
+ *   1. 标记了但 checkId 未登记 → 报红（否则「标了」会被当成「查了」）；
+ *   2. 登记了但文档里找不到标记 → 报红（否则重写文档后检查静默失效、仍然全绿）；
+ *   3. 实跑比对的是代码里的事实（如 `await writeFile(` 出现几次），不是文档里的措辞。
+ *
+ * ⚠ 诚实的边界（不得夸大）：本节**只能核对被显式标记的断言**。
+ *   没标记的文档断言**依然无人核对**。准确说法是「**把标注过的断言变成有门禁的断言**」，
+ *   **不是**「文档已自动核实」。`06 §8.4` 那个缺口被缩小了，没有被消灭。
+ */
+{
+  const docAudit = await auditDocAssertions(ROOT);
+  // **自证**：一个标记都没扫到时，「全部通过」不可信——那意味着扫描器坏了或文档目录变了
+  if (docAudit.filesScanned <= 0 || docAudit.marked <= 0) {
+    bad('文档断言核对：**没扫到任何文件或任何标记**（files=' + docAudit.filesScanned
+      + ' marked=' + docAudit.marked + '），本节结论不可信');
+  } else if (docAudit.violations.length === 0) {
+    ok('文档可证伪断言：' + docAudit.filesScanned + ' 个文档、' + docAudit.marked + ' 处标记 / '
+      + docAudit.registered + ' 项登记，实跑 ' + docAudit.checked + ' 项全部一致'
+      + '（**仅覆盖已标记的断言，不等于文档已核实**）');
+  } else {
+    bad('文档可证伪断言有 ' + docAudit.violations.length + ' 处问题：'
+      + docAudit.violations.slice(0, 3).map((v) => `[${v.why}] ${v.id}：${v.detail}`).join('；')
+      + (docAudit.violations.length > 3 ? ' …' : ''));
   }
 }
 
