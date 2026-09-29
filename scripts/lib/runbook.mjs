@@ -222,3 +222,58 @@ export function hasSignedReview(commitHash, { dispatchTable, approvalTable } = {
   }
   return { signed: false, why: '无「需签批=Y 且已被人类签批」的评审记录' };
 }
+
+
+/**
+ * 统计「同一 commit 被反复排入待签批队列」（validate 第 19 节的判据，2026-09-29）
+ *
+ * ── 为什么抽成独立纯函数 ───────────────────────────────────────────────
+ * 初版我把这个统计**内联在 `validate-expert-team.mjs` 里**，结果 selftest 根本测不到它——
+ * 由 expert/14-qa-governance 在 `DSP-20260929-0047-01` 指出（「§19 统计逻辑未抽取为独立函数
+ * 致测试盲区」）。**这是本体系的老形状**：逻辑写在门禁里 ⇒ 只能靠「整份门禁跑一遍」来验证，
+ * 而那既慢又无法构造边界情形。**判据逻辑必须住在可单测的地方。**
+ *
+ * ── 判据为什么是「入队次数」而不是「总派单次数」────────────────────────
+ * 多 commit 批次（「4-commit批次（a,b,c,d）」）会让**每个 commit 各计一次总派单**，
+ * 于是正常的一批多提交评审天然就 ≥3——**那不是重复派单，那是批次**。
+ * 真正的危害只有一个：**同一份内容被反复塞给人类签字**。故取「需签批=Y 的派单行数」。
+ *
+ * ── 阈值的来历（不拍脑袋）──────────────────────────────────────────────
+ * 实测本台账入队次数分布 `{0:2, 1:30, 2:9, 3:1, 6:1}`，次高值是 3（`363f72ea`，
+ * 建体系时同一 seed commit 的三笔种子派单）。**4 把「异常」与「历史最高」清晰隔开。**
+ * 代价是「3 次以内不告警」，已在 `06` 写明，不假装覆盖。
+ *
+ * @param {string[][]} rows 派单行，每行至少含 [派单号, 事项摘要, 需签批]
+ * @param {{threshold?:number, known?:Object}} opts
+ * @returns {{over:Array, total:Map, queued:Map, rowsSeen:number, queuedMarks:number, needSignParsed:number}}
+ */
+export function duplicateQueueStats(rows, { threshold = 4, known = {} } = {}) {
+  const E = String();
+  const total = new Map();
+  const queued = new Map();
+  let rowsSeen = 0;
+  let needSignParsed = 0;
+
+  for (const r of rows || []) {
+    const id = String(r[0] || E).trim();
+    const subject = String(r[1] || E);
+    const need = String(r[2] || E);
+    if (!id) continue;
+    rowsSeen++;
+    // needSign 必须**独立解析**，不能借用 classifyVerdict（那是审四态用的）。
+    // 解析不出 Y/N 的行不计入 queuedMarks，自证会用它判「扫描器是否坏了」。
+    if (/^\s*Y\s*$/i.test(need)) needSignParsed++;
+    for (const h of commitHashesIn(subject)) {
+      if (!total.has(h)) { total.set(h, 0); queued.set(h, []); }
+      total.set(h, total.get(h) + 1);
+      if (/^\s*Y\s*$/i.test(need)) queued.get(h).push(id);
+    }
+  }
+
+  const over = [...queued.entries()]
+    .filter(([, l]) => l.length >= threshold)
+    .map(([hash, list]) => ({ hash, list, fresh: !(hash in known), why: known[hash] || E }))
+    .sort((a, b) => b.list.length - a.list.length);
+
+  return { over, total, queued, rowsSeen, queuedMarks: needSignParsed, threshold };
+}

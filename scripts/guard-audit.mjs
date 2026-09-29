@@ -118,8 +118,46 @@ async function main() {
   dupD.length ? fail('派单号重复', [...new Set(dupD)].join(', ')) : ok(`派单号唯一（${dspIds.length} 条）`);
   dupA.length ? fail('审批单号重复', [...new Set(dupA)].join(', ')) : ok(`审批单号唯一（${apIds.length} 条）`);
   const apSet = new Set(apIds);
+  /* 「已确认半写」出口（2026-09-29，人类 A 决定）
+   *
+   * 背景：2026-09-28 实测 `DSP-20260928-2357-01` —— router **只写了派单日志行、没写待签批队列行**
+   *（两文件都归 router 所有，本该成对出现）。那一轮派单已结束、`lastHead` 已推进，
+   * **router 不会再补**；而队列归 router 所有，**助手不代写那一行**（代写就是冒充 router）。
+   * 于是这一类不一致**没有任何处置出口，只能永久红**。
+   *
+   * 判据必须是**精确标记**：核对记录「处置」列里独立出现的 `**已确认半写**`。
+   * 不用关键词匹配「半写」——本体系已在「关键词被『只是提到』骗到」上栽过 4 次；
+   * 且**必须由人在核对记录里写下**，不能由脚本自动标记，否则等于「脚本自己批准自己的异常」。
+   * 未标注者仍按**违规**处理——这个出口是「如实确认后降级为警告」，**不是「一律放过」**。
+   */
+  const HALFWAY_MARK = '**已确认半写**';
+  const EMPTY = String();
+  let ackedHalfway = new Set();
+  try {
+    const crossMd = await readFile(join(ROOT, 'docs', 'expert-team', 'runbook', '核对记录.md'), 'utf8');
+    const crossLines = crossMd.split(/\r?\n/);
+    const head = crossLines.find((l) => l.startsWith('| 派单号') && l.indexOf('处置') >= 0);
+    const ch = head ? head.split('|').slice(1, -1).map((x) => x.trim()) : [];
+    const iDisp = ch.findIndex((x) => x.indexOf('处置') >= 0);
+    if (iDisp >= 0) {
+      for (const l of crossLines) {
+        if (!l.startsWith('| DSP-')) continue;
+        const c = l.split('|').slice(1, -1).map((x) => x.trim());
+        if (c[0] && String(c[iDisp] || EMPTY).indexOf(HALFWAY_MARK) >= 0) ackedHalfway.add(c[0]);
+      }
+    }
+  } catch (e) { warn('读不到核对记录（无法判定「已确认半写」）', e.message); }
   const missingAp = dispatches.filter((d) => d.needSign === 'Y' && d.dsp && !pendings.some((p) => p.dsp && p.dsp.id === d.dsp.id));
-  missingAp.length ? fail('需签批=Y 的派单未入待签批队列', missingAp.map((d) => d.dsp.id).join(', ')) : ok('需签批=Y 条目均在待签批队列');
+  const unackedAp = missingAp.filter((d) => !ackedHalfway.has(d.dsp.id));
+  const ackedAp = missingAp.filter((d) => ackedHalfway.has(d.dsp.id));
+  if (ackedAp.length) {
+    warn('已确认半写 ' + ackedAp.length + ' 笔（router 只写派单日志、没写队列行；该轮已结束不会再补，队列归 router 所有故助手不代写）：'
+      + ackedAp.map((d) => d.dsp.id).join(', '),
+      '**处置已如实记录在核对记录里**；若认为这类半写不可接受，应改 router 的双写原子性，而不是让助手代写队列');
+  }
+  unackedAp.length
+    ? fail('需签批=Y 的派单未入待签批队列', unackedAp.map((d) => d.dsp.id).join(', '))
+    : ok('需签批=Y 条目均在待签批队列' + (ackedAp.length ? `（另有 ${ackedAp.length} 笔已确认半写，见警告）` : EMPTY));
   const dspSet = new Set(dspIds);
   const orphan = pendings.filter((p) => p.dsp && !dspSet.has(p.dsp.id));
   orphan.length ? fail('待签批条目关联的派单号不存在', orphan.map((p) => p.dsp.id).join(', ')) : ok('待签批条目均可回溯派单号');

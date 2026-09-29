@@ -7,7 +7,7 @@ import { readdir, readFile as rawReadFile } from 'node:fs/promises';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { auditHangRows } from './lib/crosscheck-hang.mjs';
 import { auditApprovalBasis, viewGeneratedAt, VIEW_FILES } from './lib/approval-basis-audit.mjs';
-import { isBarePlaceholder, commitHashesIn } from './lib/runbook.mjs';
+import { isBarePlaceholder, commitHashesIn, duplicateQueueStats } from './lib/runbook.mjs';
 import { auditDocAssertions } from './lib/doc-assert.mjs';
 import { judgeHeartbeat, resolveThreshold, VERDICT } from './lib/watchdog.mjs';
 import { execFileSync } from 'node:child_process';
@@ -750,27 +750,17 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
 /* 19. 重复派单：同一 commit 被反复排入待签批队列（2026-09-28，人类 A 立项）
  *
  * 为什么要有：2026-09-28 实测 commit `6e9416c5` 被派 **32 次**（17:48–22:54 每约 6 分钟一轮），
- *   并把同一个 commit 排了 **6 次**待签批——等于要人类把同一件事签 6 遍。
- *   **门禁当时全绿**：每一笔在结构上都是合法派单，没有任何检查会响。
- *   循环本身已由 watcher 的「幂等终态」判据修掉，但**「同一 commit 入了几次队」这件事
- *   当时无人统计、无人告警**。只修循环不统计，等于只堵了这一次、下次换个路径复发仍不可见。
+ *   并把同一个 commit 排了 **6 次**待签批——等于要人类把同一件事签 6 遍。**门禁当时全绿**：
+ *   每一笔在结构上都是合法派单，没有任何检查会响。只修循环不统计，等于只堵了这一次。
  *
- * ── 判据为什么是「入队次数」而不是「总派单次数」────────────────────────
- *   先按「总派单 ≥3」写了一版，一跑就抓到 8 个 commit——**误报太多**。原因是
- *   多 commit 批次（「4-commit批次（a, b, c, d）」）会让**每个 commit 各计一次**，
- *   于是正常的一批多提交评审天然就 ≥3。**那不是重复派单，那是批次。**
- *   真正的危害只有一个：**同一份内容被反复排进队列、反复要人类签字**。
- *   故判据取「该 commit 关联的**需签批=Y** 的派单行数」。
+ * ⚠ 统计逻辑**不在本文件里**，而在 `lib/runbook.mjs` 的 `duplicateQueueStats`。
+ *   初版内联在此，selftest 根本测不到它——由 expert/14-qa-governance 在
+ *   `DSP-20260929-0047-01` 指出「统计逻辑未抽取为独立函数致测试盲区」。
+ *   **判据逻辑必须住在可单测的地方**：写在门禁里就只能靠「整份门禁跑一遍」验证，
+ *   那既慢又无法构造边界情形。
  *
- * ── 阈值 4 的来历（不拍脑袋）──────────────────────────────────────────
- *   实测本台账的入队次数分布：{0:2, 1:30, 2:9, 3:1, 6:1}。
- *   次高值是 3（`363f72ea`，2026-09-25 建体系时的三笔种子派单，本就是同一 seed commit 的
- *   三次独立评审）。**4 把「异常」与「历史最高」清晰地隔开**，且当前只有 6e9416c5 命中。
- *   若将来某个 commit 真的入队 4 次，那**几乎一定是出问题了**——这个阈值的代价是
- *   「3 次以内不告警」，如实记下，不假装覆盖。
- *
- * ⚠ 与幂等终态的分工：那一条判「这一轮能否推进基线」，本条判「历史上有没有把同一件事
- *   反复塞给人类」。两者不可互相替代——循环修好后本节对**新**重复仍会报红，这才是价值。
+ * 判据与阈值的来历见 `lib/runbook.mjs` 该函数的 JSDoc（实测分布 {0:2,1:30,2:9,3:1,6:1}，
+ * 次高值 3 故取 4；代价是「3 次以内不告警」，已在 `06` 写明）。
  */
 {
   const KNOWN_Q = {
@@ -779,6 +769,10 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
   };
   const Q_THRESHOLD = 4;
   const E19 = String();
+
+  // 派单行：从已读入的 dispatchLogText 切出，并**按表头名**定位「事项摘要」与「需签批」两列。
+  // 写死列索引的教训本轮又栽了一次：曾先写了一个 validate 里根本不存在的变量名，
+  // 且差点再写死第 3 列——核对记录的列序已经坑过我两次（处置列 6 vs 7）。
   const dispRows19 = (() => {
     const src = String(dispatchLogText || E19);
     const rows = [];
@@ -786,11 +780,12 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
     if (!head) return rows;
     const h = head.split('|').slice(1, -1).map((x) => x.trim());
     const iSub = h.findIndex((x) => x.indexOf('事项摘要') >= 0);
-    if (iSub < 0) return rows;
+    const iNeed = h.findIndex((x) => x.indexOf('需签批') >= 0);
+    if (iSub < 0 || iNeed < 0) return rows;
     for (const l of src.split('\n')) {
       if (!l.startsWith('| DSP-')) continue;
       const r = l.split('|').slice(1, -1).map((x) => x.trim());
-      rows.push([String(r[0] || E19), String(r[iSub] || E19), String(r[8] || E19)]);
+      rows.push([String(r[0] || E19), String(r[iSub] || E19), String(r[iNeed] || E19)]);
     }
     return rows;
   })();
@@ -800,50 +795,36 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
   } else if (dispRows19.length === 0) {
     bad('重复派单检查：**一行派单都没读到**，本节结论不可信');
   } else {
-    const total = new Map();
-    const queued = new Map();
-    let isY = 0;
-    for (const r of dispRows19) {
-      for (const h of commitHashesIn(r[1])) {
-        if (!total.has(h)) { total.set(h, 0); queued.set(h, []); }
-        total.set(h, total.get(h) + 1);
-        if (/^\s*Y\s*$/i.test(r[2])) { queued.get(h).push(r[0]); isY++; }
-      }
-    }
-    // **自证**：一个入队标记都没解析出来时，「无重复」不可信。
-    // 必须报：否则「解析器写坏了」与「没有重复」会输出同一句话——
-    // 本轮已经栽过一次假零（变量名撞车导致每行 continue，却输出「0 处」）。
-    if (isY === 0) {
+    const q19 = duplicateQueueStats(dispRows19, { threshold: Q_THRESHOLD, known: KNOWN_Q });
+    // **自证**：入队标记一个都没解析出来时，「无重复」不可信——
+    // 「解析器坏了」与「没有重复」会输出同一句话。
+    // 本轮已栽过一次假零（变量名撞车导致每行 continue，却输出「0 处」）。
+    if (q19.queuedMarks === 0) {
       bad('重复派单检查：入队标记（需签批=Y）**一个都没解析出来**，本节结论不可信');
     } else {
-      const over = [...queued.entries()].filter(([, l]) => l.length >= Q_THRESHOLD)
-        .sort((a, b) => b[1].length - a[1].length);
-      const fresh = over.filter(([h]) => !(h in KNOWN_Q));
-      const known = over.filter(([h]) => h in KNOWN_Q);
-      for (const [h, l] of known) {
-        log(`  ⚠ 已知旧账 ${h}（入队 ${l.length} 次）：${KNOWN_Q[h]}`);
-      }
-      // Top 计数作为信息行输出：让「趋势」可见，而不是只在越线时才说话
-      const top = [...total.entries()].sort((a, b) => b[1] - a[1].length).slice(0, 3)
+      const fresh = q19.over.filter((x) => x.fresh);
+      const known = q19.over.filter((x) => !x.fresh);
+      for (const x of known) log(`  ⚠ 已知旧账 ${x.hash}（入队 ${x.list.length} 次）：${x.why}`);
+      // Top 计数作为信息行输出：让趋势可见，而不是只在越线时才说话
+      const top = [...q19.total.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
         .map(([h, n]) => `${h}×${n}`).join('、');
       if (fresh.length) {
         bad('重复入队告警：' + fresh.length + ' 个 commit 被排入待签批队列 ≥' + Q_THRESHOLD + ' 次：'
-          + fresh.slice(0, 3).map(([h, l]) => `${h}×${l.length}（${l.slice(0, 3).join('/')}${l.length > 3 ? '…' : ''}）`).join('；')
-          + (fresh.length > 3 ? ' …' : '')
+          + fresh.slice(0, 3).map((x) => `${x.hash}×${x.list.length}（${x.list.slice(0, 3).join('/')}${x.list.length > 3 ? '…' : E19}）`).join('；')
+          + (fresh.length > 3 ? ' …' : E19)
           + '　——**同一份内容反复要人类签字**，而每一笔在结构上都是合法派单、门禁当时全绿。'
           + '查法：`git log --oneline -1 <hash>` 确认该 commit，再看 `logs/watcher.log` 找循环区间；'
           + '根因通常是「幂等跳过被 fail-closed 判成失败 → 不推进 lastHead → 下一轮又派」。'
           + `（总派单 Top3：${top}）`);
       } else {
-        ok('重复入队：' + dispRows19.length + ' 行派单 / ' + total.size + ' 个 commit / 入队标记 ' + isY + ' 处，'
-          + '无「同一 commit 入队 ≥' + Q_THRESHOLD + ' 次」'
-          + (known.length ? `（另有 ${known.length} 个已知旧账已显式列出）` : '')
+        ok('重复入队：' + dispRows19.length + ' 行派单 / ' + q19.total.size + ' 个 commit / 入队标记 '
+          + q19.queuedMarks + ' 处，无「同一 commit 入队 ≥' + Q_THRESHOLD + ' 次」'
+          + (known.length ? `（另有 ${known.length} 个已知旧账已显式列出）` : E19)
           + `。总派单 Top3：${top}`);
       }
     }
   }
 }
-
 
 /* 20. 文档「可证伪断言」核对（2026-09-28，人类 A 立项；实现见 lib/doc-assert.mjs）
  *

@@ -21,7 +21,7 @@ import {
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict, parseSerial, isBarePlaceholder } from './lib/runbook.mjs';
 import { auditDocAssertions, markersIn, DOC_CHECKS } from './lib/doc-assert.mjs';
-import { hasSignedReview, commitHashesIn, readRunbook } from './lib/runbook.mjs';
+import { hasSignedReview, commitHashesIn, readRunbook, duplicateQueueStats } from './lib/runbook.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
 import { auditApprovalBasis, splitClauses, viewGeneratedAt, daysStale, PRODUCERS } from './lib/approval-basis-audit.mjs';
@@ -1237,6 +1237,81 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     truthy(/marked <= 0/.test(v22), '  └ 对「没扫到任何标记」有自证拒绝放行（防假零）');
     truthy(/不等于文档已核实/.test(v22), '  └ 输出文案自带边界声明（不得被读成「文档已核实」）');
     void E22;
+  }
+  // 22.16 重复入队统计（lib/runbook.mjs 的 duplicateQueueStats，validate 第 19 节）
+  //
+  // 这一组存在的理由是**修一个测试盲区**：初版把这个统计内联在 validate 里，
+  // selftest 根本测不到它——由 expert/14-qa-governance 在 DSP-20260929-0047-01 指出。
+  // **判据逻辑住在门禁文件里，就只能靠「整份门禁跑一遍」验证**，那既慢又无法构造边界情形。
+  // 抽成纯函数后，下面这些边界才可以被直接断言。
+  {
+    const E = String();
+    const mk = (id, hash, need) => [id, '自主评审·commit ' + hash, need];
+    // 同一个 hash 连续入队 3 次（低于阈值 4）→ 不得报
+    const r3 = duplicateQueueStats([mk('D1', 'aaaa1111', 'Y'), mk('D2', 'aaaa1111', 'Y'), mk('D3', 'aaaa1111', 'Y')]);
+    eq(r3.over.length, 0, '入队 3 次（< 阈值 4）不告警');
+    eq(r3.rowsSeen, 3, '  └ 三行都被计入（自证：rowsSeen 不是 0）');
+    eq(r3.queuedMarks, 3, '  └ 三个 Y 都被解析出来');
+    // 恰好到阈值 4 → 报
+    const r4 = duplicateQueueStats([mk('D1', 'aaaa1111', 'Y'), mk('D2', 'aaaa1111', 'Y'), mk('D3', 'aaaa1111', 'Y'), mk('D4', 'aaaa1111', 'Y')]);
+    eq(r4.over.length, 1, '入队 4 次（= 阈值）告警');
+    eq(r4.over[0].hash, 'aaaa1111', '  └ 点名的是那个 hash');
+    eq(r4.over[0].list.length, 4, '  └ 列出 4 个派单号（可定位到具体哪几笔）');
+    eq(r4.over[0].fresh, true, '  └ 未登记 → fresh（应报红）');
+
+    // **最关键的一条边界**：需签批=N 的重复派单**不告警**。
+    // 这是「判据取入队次数而非总派单次数」的全部意义——多 commit 批次与幂等去重行
+    // 会让总派单数天然偏高，若按总派单判就会把正常批次报成重复。
+    const rN = duplicateQueueStats([mk('D1', 'bbbb2222', 'N'), mk('D2', 'bbbb2222', 'N'), mk('D3', 'bbbb2222', 'N'), mk('D4', 'bbbb2222', 'N'), mk('D5', 'bbbb2222', 'N')]);
+    eq(rN.over.length, 0, '同一 commit 派 5 次但全需签批=N → 不告警');
+    eq(rN.total.get('bbbb2222'), 5, '  └ 但总派单数确实是 5（说明不是没统计到，是判据只看入队）');
+    eq(rN.queuedMarks, 0, '  └ 入队标记 0 处——自证信号：validate 用它判「扫描器是否坏了」');
+
+    // 混合：4 次里只有 2 次入队 → 不告警
+    const rm = duplicateQueueStats([mk('D1', 'cccc3333', 'Y'), mk('D2', 'cccc3333', 'N'), mk('D3', 'cccc3333', 'Y'), mk('D4', 'cccc3333', 'N')]);
+    eq(rm.over.length, 0, '派 4 次、其中仅 2 次入队 → 不告警（判据是入队次数）');
+
+    // known 白名单：登记过的只标记为非 fresh，不进 fresh 列表
+    const rk = duplicateQueueStats([mk('D1', 'dddd4444', 'Y'), mk('D2', 'dddd4444', 'Y'), mk('D3', 'dddd4444', 'Y'), mk('D4', 'dddd4444', 'Y')],
+      { known: { dddd4444: '已知旧账：已定位并修' } });
+    eq(rk.over.length, 1, '  └ 仍在 over 里（可见，不隐藏）');
+    eq(rk.over[0].fresh, false, '  └ 但 fresh=false（不报红）');
+    eq(rk.over[0].why, '已知旧账：已定位并修', '  └ 带出已知旧账的原因（供日志行显示）');
+    eq(rk.over.filter((x) => x.fresh).length, 0, '  └ fresh 列表为空 → validate 不报红');
+
+    // **反向断言：把 known 去掉，同一批数据必须变红。**
+    // 这一条是本组的意义所在——若 known 过滤逻辑写坏了（永远 fresh=false），
+    // 上面的断言仍可能全过，因为它们只看 fresh=false。必须有一组证明「能红」。
+    eq(duplicateQueueStats([mk('D1', 'dddd4444', 'Y'), mk('D2', 'dddd4444', 'Y'), mk('D3', 'dddd4444', 'Y'), mk('D4', 'dddd4444', 'Y')])
+      .over.filter((x) => x.fresh).length, 1, '反向断言：同一个 hash 不登记为 known 时**必须**变红');
+
+    // 多 commit 批次：一行摘要里含多个 hash → 每个各计一次
+    const rBatch = duplicateQueueStats([
+      ['B1', '4-commit批次（1111aaaa, 2222bbbb, 3333cccc, 4444dddd）', 'Y'],
+      ['B2', '4-commit批次（1111aaaa, 2222bbbb, 3333cccc, 4444dddd）', 'Y'],
+    ]);
+    eq(rBatch.total.size, 4, '一行 4-commit 批次抽出 4 个 hash（不是 1 个）');
+    eq(rBatch.rowsSeen, 2, '  └ 但只算 2 行派单（行数与 hash 数是两回事）');
+
+    // 边界：空输入 / 全空行 → 必须自证为「什么都没读到」而不是「无重复」
+    const rEmpty = duplicateQueueStats([]);
+    eq(rEmpty.rowsSeen, 0, '空输入 rowsSeen=0');
+    eq(rEmpty.queuedMarks, 0, '  └ queuedMarks=0 —— validate 据此拒绝相信「无重复」');
+    const rBlank = duplicateQueueStats([[E, E, E], [E, E, E]]);
+    eq(rBlank.rowsSeen, 0, '两行全空的行不被计入（派单号为空的行跳过）');
+
+    // 抽不出 hash 的行：仍计入 rowsSeen（行存在），但不产生任何 hash 统计
+    const rNoHash = duplicateQueueStats([['D1', '没有 commit 号的说明文字', 'Y']]);
+    eq(rNoHash.rowsSeen, 1, '无 hash 的行仍计入 rowsSeen');
+    eq(rNoHash.total.size, 0, '  └ 但 total 为空（不会凭空造 hash）');
+    eq(rNoHash.queuedMarks, 1, '  └ queuedMarks 仍为 1（Y 被解析到了）');
+
+    // 接线：validate 必须真的调它，且 06 必须写明阈值来历——否则「阈值 4」就成了拍脑袋
+    const v22 = await readFile(join(ROOT, 'scripts', 'validate-expert-team.mjs'), 'utf8');
+    truthy(/duplicateQueueStats\(dispRows19/.test(v22), 'validate 第 19 节确实调用 duplicateQueueStats（不是内联逻辑）');
+    truthy(!/const over = \[\.\.\.queued\.entries\(\)\]/.test(v22), '  └ 旧的内联统计已移除（否则等于有两份判据，理解会漂移）');
+    const d06 = await readFile(join(ROOT, 'docs', 'expert-team', '06-门禁阈值与判定口径.md'), 'utf8');
+    truthy(/\{0:2,\s*1:30/.test(d06), '06 写明了阈值 4 的实测分布来历（不是拍脑袋）');
   }
 
 
