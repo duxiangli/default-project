@@ -17,7 +17,7 @@ import {
   REVIEW_PROMPT, statePathOf, loadState, saveState, acquireLock, git, parseRunStream,
   breakerUpdate, breakerAllows, BREAKER_DEFAULTS, STATE_VERSION,
   buildSerialNotice, runCli, splitExempt, countDispatchRows, sourceFingerprint, EXIT_CODE_STALE, MAX_RESTART_DEPTH,
-  effectiveDepth, RESTART_CHAIN_RESET_MS, driftIntervalMs,
+  effectiveDepth, RESTART_CHAIN_RESET_MS, driftIntervalMs, judgeHealth,
 } from './autodispatch-watcher.mjs';
 import { classifyVerdict, parseSerial, isBarePlaceholder } from './lib/runbook.mjs';
 import { auditDocAssertions, markersIn, DOC_CHECKS } from './lib/doc-assert.mjs';
@@ -1416,6 +1416,51 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     // 断言必须只查**代码行**：注释里引用旧写法字面量是合法的（那是解释性注释）
     truthy(wCode.indexOf('String(e.message || e)') < 0, '  └ 代码行里旧写法清零（注释里的引用不算）');
     truthy(w.split(/\r?\n/).some((l) => /lib\/err-text\.mjs/.test(l)), '  └ import 已接上');
+  }
+
+  // 22.18 探活判定（lib 外置纯函数 judgeHealth，2026-09-29）
+  //
+  // 为什么要有：watcher.log 连续 N 轮「熔断自动恢复→探活通过→派单 403→再熔断」，
+  // trips 从 75 涨到 84。根因是旧判定 `ok = p.conclusion || p.sessionId` **无视 errors**：
+  // `opencode run --format json` 的事件流里 `step_start` 先到（带 sessionID）、
+  // 模型错误后到（provider.auth 403）——于是 sessionId 恒有值，探活恒绿，
+  // 哪怕该轮**必然产不出结论**。fail-closed 语义：errors 非空即不健康。
+  {
+    // ① 正常：无 errors + 有会话 → 绿
+    eq(judgeHealth({ sessionId: 'ses_x', conclusion: null, errors: [] }), true, '① 无 errors + 会话 → 绿');
+    // ② 正常：无 errors + 有结论 → 绿（v.s. 上面 sessionId 侧）
+    eq(judgeHealth({ sessionId: null, conclusion: true, errors: [] }), true, '② 无 errors + 结论 → 绿');
+    // ③ **反向**：真实 403 事件流（step_start 先到、provider.auth 后到）→ 必须红
+    //    ——这正是旧判定假绿的形状：sessionId 已经有值，error 也进来了。
+    const realStream = [
+      JSON.stringify({ type: 'step_start', sessionID: 'ses_f14991b1', part: { type: 'step-start', sessionID: 'ses_f14991b1', messageID: 'msg_x' } }),
+      JSON.stringify({ type: 'error', sessionID: 'ses_f14991b1', error: { type: 'provider.auth', message: 'This model is not available in your region.', status: 403 } }),
+    ].join('\n');
+    const realParsed = parseRunStream(realStream);
+    truthy(realParsed.sessionId, '③ 真实流解析出 sessionId（step_start 先到）');
+    eq(realParsed.errors.length, 1, '  └ 同时 errors 也解析到了（403 被捕获）');
+    eq(judgeHealth(realParsed), false, '  └ **旧判定=绿，新判定=红**（这正是要修的假绿）');
+    // ③b 反向对照：同流去掉 error，只留 step_start + 一段无 error → 绿
+    const okStream = [
+      JSON.stringify({ type: 'step_start', sessionID: 'ses_ok1', part: { type: 'step-start', sessionID: 'ses_ok1', messageID: 'msg_y' } }),
+      JSON.stringify({ type: 'text', sessionID: 'ses_ok1', part: { type: 'text', text: 'PONG' } }),
+    ].join('\n');
+    eq(judgeHealth(parseRunStream(okStream)), true, '  └ 正常流 → 绿');
+    // ③c 无会话也无结论 → 红（被判定为不通过，而不是「不置可否」）
+    eq(judgeHealth({ sessionId: null, conclusion: null, errors: [] }), false, '  └ 空会话空结论 → 红');
+    // ③d errors 数组缺失/为 null → 红（fail-closed，不把缺数据当绿灯）
+    eq(judgeHealth({ sessionId: 'ses_z', conclusion: null, errors: null }), false, '  └ errors 缺失 → 红');
+    eq(judgeHealth({ sessionId: 'ses_z', conclusion: null }), false, '  └ errors 字段不存在 → 红');
+
+    // ④ 接线：healthCheck 真的用了 judgeHealth，而不是旧表达式
+    const w = await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8');
+    const wCode = w.split(/\r?\n/).filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    truthy(wCode.indexOf('const ok = judgeHealth(p)') >= 0, '④ healthCheck 调用 judgeHealth');
+    // ⚠ 不能断言「代码行里没有 p.conclusion || p.sessionId」——那是**断言自己写错了**：
+    //   judgeHealth 的实现 `errors空 && (p.conclusion || p.sessionId)` 本来就要用这个子句。
+    //   该清零的是旧写法「**独立赋值** `const ok = p.conclusion || p.sessionId`（无视 errors）」。
+    truthy(wCode.indexOf('const ok = p.conclusion || p.sessionId') < 0, '  └ 旧独立赋值已从**代码行**清零（judgeHealth 内的子句是合法的）');
+    eq((wCode.match(/judgeHealth\(/g) || []).length >= 2, true, '  └ 定义 + 调用 至少两处');
   }
 
 console.log('\n[23] fail-closed 门：失败轮次不得推进基线（①：曾出现「结论产出=false 但 lastHead 已推进」）');

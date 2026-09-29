@@ -881,6 +881,23 @@ async function refreshViews() {
   return { ok: results.every((r) => r.ok), results };
 }
 
+/**
+ * 探活判定（纯函数，可单测）：**fail-closed**——errors 非空即不健康。
+ *
+ * ── 为什么必须看 errors（2026-09-29 实测）─────────────────────────────
+ * 旧写法 `p.conclusion || p.sessionId` **无视 errors**，导致探活恒绿：
+ * `opencode run --format json` 的事件流里，`step_start` **先到**（带 sessionID），
+ * 模型错误（如 `provider.auth: This model is not available in your region.`, 403）**后到**。
+ * 于是 sessionId 恒有值 → `ok=true`，即使该轮**必然无法产出结论**。
+ * 实测后果：watcher.log 每 2 分钟一轮「熔断自动恢复→探活通过→派单 403→再熔断」，breaker.trips 连涨。
+ *
+ * fail-closed 语义：**有会话/结论只是「会话建起来了」，不代表模型可用**。
+ * 只要事件流里出现任何 error，就按不健康处理——宁可不派单，也不要在明知会失败时硬派。
+ */
+export function judgeHealth(p) {
+  return Boolean(p && p.errors && p.errors.length === 0 && (p.conclusion || p.sessionId));
+}
+
 /** 通道健康检查：最小提示词探活。探不通就不派单，避免把服务楔死 */
 export async function healthCheck(cli, dir, { timeout = 90000 } = {}) {
   const t0 = Date.now();
@@ -888,8 +905,8 @@ export async function healthCheck(cli, dir, { timeout = 90000 } = {}) {
     const r = await runCli(cli, ["run", "--agent", "build", "--format", "json", "只回一行 PONG"],
       { cwd: dir, timeout, maxBuffer: 8 * 1024 * 1024 });
     const p = parseRunStream((r.stdout || "") + (r.stderr || ''));
-    const ok = p.conclusion || p.sessionId;
-    return { ok: Boolean(ok), ms: Date.now() - t0, sessionId: p.sessionId || null, errors: p.errors };
+    const ok = judgeHealth(p);
+    return { ok, ms: Date.now() - t0, sessionId: p.sessionId || null, errors: p.errors };
   } catch (e) {
     return { ok: false, ms: Date.now() - t0, sessionId: null, errors: [caughtText(e, { max: 200 }).text] };
   }
