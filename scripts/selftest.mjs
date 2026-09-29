@@ -367,6 +367,20 @@ console.log('\n[14] 台账医生：检测 + 自动修复 + 幂等（派单后自
   eq(analyze(fixed2.text, SPEC).issues.length, 0, '补列后无问题');
   truthy(fixed2.text.includes('| —'), '缺失值填「—」而非臆造四态/需签批');
 
+  // ②b 回归（2026-09-29 实测事故）：修复"某行缺列"时**不得连带改写列数正确行的末列**。
+  //   旧实现 `cells.slice(1,-1)`（在已剥尾部空串后又切一刀）会把每行末格切掉、再用「—」补回，
+  //   于是**所有行的末列（需签批）被静默清空**——本事故中 533 行 Y/N 全灭。此断言锁死该行为。
+  const goodY = '| DSP-A | t | s | ha | r | c | d | 结论Y | Y |';
+  const goodN = '| DSP-B | t | s | ha | r | c | d | 结论N | N |';
+  const missing = '| DSP-C | t | s | ha | r | c | d |';   // 8 列，触发 pad-cols
+  const mixed = `# 派单日志\n\n| 派单号 | a | b | c | d | e | f | g | h |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${goodY}\n${goodN}\n${missing}\n\n<!-- dispatch-log-end -->\n`;
+  const fixedMixed = repair(mixed, SPEC);
+  truthy(fixedMixed.text.includes('| 结论Y | Y |'), '补列时好行末列 Y 不被抹（回归 2026-09-29）');
+  truthy(fixedMixed.text.includes('| 结论N | N |'), '补列时好行末列 N 不被抹（回归 2026-09-29）');
+  truthy(fixedMixed.text.includes('| DSP-C | t | s | ha | r | c | d | — | — |'), '仅缺列行补「—」');
+  eq(analyze(fixedMixed.text, SPEC).issues.length, 0, '混合修复后无问题');
+  truthy(fixedMixed.text.includes(goodY), '好行逐字不变（不被重排/改格式）');
+
   // ③ 表格内空行（把表断成两段，解析器只读第一段）
   const blank = `# 派单日志\n\n| 派单号 | a | b | c | d | e | f | g | h |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${row('DSP-1')}\n\n${row('DSP-2')}\n\n<!-- dispatch-log-end -->\n`;
   truthy(analyze(blank, SPEC).issues.some((i) => i.kind === 'blank-in-table'), '检出表格内空行');
