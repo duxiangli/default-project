@@ -29,6 +29,9 @@ $log = Join-Path $Repo 'logs\watchdog.log'
 $wlog = Join-Path $Repo 'logs\watcher.log'
 New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
 function W($m) {
+  # 时间基准声明（2026-09-29 统一）：logs/watchdog.log 用**本地时间**（Get-Date 默认）。
+  # 与 watcher.log/state 的 UTC 对照表见 docs/expert-team/04-编排与门禁.md §4.1.1。
+  # 注意：心跳静默判定必须用 watcher.log 的 UTC（见下方第 2 步），此处仅日志展示用本地。
   $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m
   Add-Content -Path $log -Value $line -Encoding utf8
 }

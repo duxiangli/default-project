@@ -583,7 +583,7 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
     for (const [k, why] of Object.entries(KNOWN_TS)) {
       if (tsIssues.some((s) => s.startsWith(k))) log(`  ⚠ 已知旧账 ${k}：${why}`);
     }
-    if (tsKnown) log(`  ⚠ 另有一类自洽但失真：DSP-20260927-0110-01 号 01:10 / 时间列 01:10 / 真实 02:32:11（偏差 82 分钟）——本检查结构上抓不到，只能靠 watcher 日志对`);
+    if (tsKnown) log(`  ℹ 历史溯因（根因已修复，b5349f5）：DSP-20260927-0110-01 曾「号内时间≡时间列但≠真实派单时刻」（号/时间列 01:10，真实 02:32:11，偏差 82 分钟）——该形态由 router 自编号造成，b5349f5 起已改为脚本按真实时钟生成派单号；此条是已知历史账的溯因说明，不再视为本轮新增偏离`);
   } else {
     bad(`派单时间戳新增不符 ${tsNew.length} 处: ${tsNew.slice(0, 4).join('; ')}${tsNew.length > 4 ? ' …' : ''}`);
   }

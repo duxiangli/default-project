@@ -65,6 +65,8 @@ const MAX_PROMPT_CHARS = 4000;
 const MAX_FILES = 200;
 const MIN_INTERVAL = 5;
 
+// 时间基准声明（2026-09-29 统一）：logs/watcher.log 全部走 UTC（toISOString()）。
+// 与台账时间列/派单号（本地+8）、watchdog.log（本地）的对照见 docs/expert-team/04-编排与门禁.md §4.1.1。
 const now = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 const log = (...a) => console.log(`[${now()}]`, ...a);
 
@@ -1111,28 +1113,16 @@ async function poll(ctx) {
   else log('点路径清单：本批无点路径变更文件');
 
   const untrusted = buildUntrustedBlock(plan.take, files);
-  // ② 派单号由脚本按真实时钟生成并注入：router 此前自行编造整点号（0100/0110…）且与
-  // 台账时间列串通，偏差实测达 82 分钟，闭环时长统计因此失真。算得出的不该让 LLM 编。
-  const at = new Date();
-  const ymd = `${at.getFullYear()}${String(at.getMonth() + 1).padStart(2, '0')}${String(at.getDate()).padStart(2, '0')}`;
-  const hm = `${String(at.getHours()).padStart(2, '0')}${String(at.getMinutes()).padStart(2, '0')}`;
-  const atText = `${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, '0')}-${String(at.getDate()).padStart(2, '0')} ${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
-  const dsp = `DSP-${ymd}-${hm}-01`;
-  const serial = buildSerialNotice({ dsp, ap: `AP-${ymd}-${hm}-01`, at: atText, commits: plan.take.length });
-  // headline 只放脚本算出的事实（数量、真实时刻、commit hash 前缀）；
-  // subject 与正文一律留在不可信块内 —— 此前 headline 直接带 subject，
-  // 意味着不可信文本出现在安全边界描述的「数据块」之外。
-  const headline = `【事件推送·自主评审】本地仓库检测到新提交 ${plan.take.length} 条`
-    + `${plan.overflow ? `（另有 ${plan.overflow} 条将在下轮续派）` : ''}`
-    + `（时刻 ${atText}，commit：${plan.take.map((c) => c.hash.slice(0, 8)).join(' ')}）`;
-  const text = REVIEW_PROMPT(headline, untrusted, pre, dot, serial);
-  log(`派单号（脚本生成）: ${dsp}`);
 
+  // dry-run 分支提前：dry-run 只是预览，不派单、**不生成也不宣告真实派单号**——
+  // 若在此生成并宣告，「派单号（脚本生成）」一行会留在 watcher.log，
+  // 变成「宣告了但永不落台账」的悬空号，被 watchdog 判作废。
   if (flags.dryRun) {
     log(`dry-run：窗口新提交 ${commits.length} 条，本批将派 ${plan.take.length} 条，溢出 ${plan.overflow} 条`);
     for (const c of plan.take) log(`  [will-fire] ${c.hash.slice(0, 8)} ${sanitizeUntrusted(c.subject)}`);
     if (files.length) log(`  变更文件 ${files.length} 个（前 10）：${files.slice(0, 10).join(', ')}`);
-    log('---- 提示词预览 ----\n' + text.slice(0, 800));
+    const preview = REVIEW_PROMPT(`【事件推送·自主评审】本地仓库检测到新提交 ${plan.take.length} 条（dry-run 预览）`, untrusted, pre, dot);
+    log('---- 提示词预览 ----\n' + preview.slice(0, 800));
     return { ...summary, mode: 'dry-run', hashes: plan.take.map((c) => c.hash) };
   }
 
@@ -1178,6 +1168,27 @@ async function poll(ctx) {
     return { ...summary, ok: false, error: 'channel-unhealthy', healthMs: h.ms, breaker: repo.breaker };
   }
   log(`  通道探活通过（${h.ms}ms）`);
+
+  // ── 派单号生成 + 宣告：必须排在熔断闸门与通道探活**通过之后**（2026-09-29 根因修复）──
+  // 背景：此前号生成/宣告（含 `log(派单号（脚本生成）…)`）在熔断闸门之前。
+  // 熔断期间 watcher 每 ~2 分钟空转一轮，每轮都会生成并宣告一个新号，但从未真正派单，
+  // 台账自始至终无对应行 → watchdog 把这类「宣告过但无落账」的号全部判作废，
+  // 累计形成 400+ 个作废序列号（logs/watchdog.log 可见）。号是「我真要派单了」的承诺，
+  // 只有闸门全部通过、探活确认通道可用之后才有资格生成；dry-run 预览则完全不生成号。
+  const at = new Date();
+  const ymd = `${at.getFullYear()}${String(at.getMonth() + 1).padStart(2, '0')}${String(at.getDate()).padStart(2, '0')}`;
+  const hm = `${String(at.getHours()).padStart(2, '0')}${String(at.getMinutes()).padStart(2, '0')}`;
+  const atText = `${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, '0')}-${String(at.getDate()).padStart(2, '0')} ${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+  const dsp = `DSP-${ymd}-${hm}-01`;
+  const serial = buildSerialNotice({ dsp, ap: `AP-${ymd}-${hm}-01`, at: atText, commits: plan.take.length });
+  // headline 只放脚本算出的事实（数量、真实时刻、commit hash 前缀）；
+  // subject 与正文一律留在不可信块内 —— 此前 headline 直接带 subject，
+  // 意味着不可信文本出现在安全边界描述的「数据块」之外。
+  const headline = `【事件推送·自主评审】本地仓库检测到新提交 ${plan.take.length} 条`
+    + `${plan.overflow ? `（另有 ${plan.overflow} 条将在下轮续派）` : ''}`
+    + `（时刻 ${atText}，commit：${plan.take.map((c) => c.hash.slice(0, 8)).join(' ')}）`;
+  const text = REVIEW_PROMPT(headline, untrusted, pre, dot, serial);
+  log(`派单号（脚本生成）: ${dsp}`);
 
   // 幂等终态判据要用：派单日志（找 需签批=Y 的行）与审批台账（找签批结论）。
   // 这里读的是**本轮派单之前**的台账，故 lastHead 推进后不会自证——这是有意的。
