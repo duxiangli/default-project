@@ -9,6 +9,7 @@ import { auditHangRows } from './lib/crosscheck-hang.mjs';
 import { auditApprovalBasis, viewGeneratedAt, VIEW_FILES } from './lib/approval-basis-audit.mjs';
 import { isBarePlaceholder, commitHashesIn, duplicateQueueStats } from './lib/runbook.mjs';
 import { auditDocAssertions } from './lib/doc-assert.mjs';
+import { auditColumnShapes } from './lib/col-shape.mjs';
 import { judgeHeartbeat, resolveThreshold, VERDICT } from './lib/watchdog.mjs';
 import { execFileSync } from 'node:child_process';
 
@@ -860,6 +861,44 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
     bad('文档可证伪断言有 ' + docAudit.violations.length + ' 处问题：'
       + docAudit.violations.slice(0, 3).map((v) => `[${v.why}] ${v.id}：${v.detail}`).join('；')
       + (docAudit.violations.length > 3 ? ' …' : ''));
+  }
+}
+
+/* 21. 台账「列形态」自证（2026-09-29，人类 A 立项；实现见 lib/col-shape.mjs）
+ *
+ * 补的是一类**所有现有门禁都抓不到**的错：`核对记录.md` 曾有 9 行**整格错位**——
+ * 我把「可验证反证」与「差集说明」当成两列分别填，而表头第 6 列名叫
+ * 「可验证反证 / 差集说明」，**斜杠就表示合并成一格**。于是差集挤进「处置」列、
+ * 处置挤进「复核人」列、**复核人直接丢失**。
+ *
+ * **它为什么一路绿灯**：列数是对的（8 列仍是 8 列），所以 ledger-doctor 的列宽检查、
+ * validate 的挂账纪律、seed --check 的占位符检查**全都抓不到**。
+ * 错的不是列数，是**内容形态**。本节补的就是这一类。
+ *
+ * ⚠ 判据是「该列不该长什么样」（长度/标点/是否为空），**不是**「该列该长什么样子」的白名单。
+ *   我第一版用白名单正则判处置列，39 行报 35 行，绝大多数是误报——`无需处置（批准）`、
+ *   `同上` 都是合法处置却没匹配上。**黑名单式判定只能挡住预想到的形态**，
+ *   这个问题我在别处反复批评过，结果自己在同一个钟点上又犯了一次。
+ *
+ * ⚠ 与第 17 节（挂账）、ledger-doctor（列宽）的分工：那两节判「有没有填、有没有对齐」，
+ *   本节判「填进去的东西**是不是这一列该装的东西**」。三者不可互相替代。
+ */
+{
+  const shapeAudit = await auditColumnShapes(ROOT);
+  // **自证**：三件都不可为零。零行扫描或零格判定时，「0 处违规」不可信——
+  // 「表读空了」与「全部合规」会输出同一句话。
+  if (shapeAudit.filesRead <= 0 || shapeAudit.rowsScanned <= 0 || shapeAudit.cellsJudged <= 0) {
+    bad('列形态自证：filesRead=' + shapeAudit.filesRead + ' rows=' + shapeAudit.rowsScanned
+      + ' cells=' + shapeAudit.cellsJudged + '，**没比对到任何一格**，本节结论不可信');
+  } else if (shapeAudit.violations.length === 0) {
+    ok('列形态：' + shapeAudit.specsApplied + ' 项规格 / ' + shapeAudit.filesRead + ' 张表 / '
+      + shapeAudit.rowsScanned + ' 行 / ' + shapeAudit.cellsJudged + ' 格，形态全部合规'
+      + '（**只覆盖规格里列出的那几列**，不等于全表内容都对）');
+  } else {
+    bad('列形态不合 ' + shapeAudit.violations.length + ' 处：'
+      + shapeAudit.violations.slice(0, 4).map((v) => `${v.id} 的「${v.col}」${v.detail}`).join('；')
+      + (shapeAudit.violations.length > 4 ? ' …' : '')
+      + '　——这类错列数是对的，靠列宽检查抓不到；处置见 lib/col-shape.mjs 的 JSDoc');
   }
 }
 
