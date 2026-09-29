@@ -22,6 +22,7 @@ import {
 import { classifyVerdict, parseSerial, isBarePlaceholder } from './lib/runbook.mjs';
 import { auditDocAssertions, markersIn, DOC_CHECKS } from './lib/doc-assert.mjs';
 import { hasSignedReview, commitHashesIn, readRunbook, duplicateQueueStats } from './lib/runbook.mjs';
+import { errText, caughtText } from './lib/err-text.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
 import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
 import { auditApprovalBasis, splitClauses, viewGeneratedAt, daysStale, PRODUCERS } from './lib/approval-basis-audit.mjs';
@@ -1330,6 +1331,92 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
   eq(realAudit.ok, true, `真实白名单在 ${realFiles.length} 个文件上通过语义审计`);
   truthy(realAudit.rules.every((r) => r.gen.length === r.matched.length), '每条规则所豁免文件全部为 GENERATED');
 }
+  // 22.17 错误文本提取（lib/err-text.mjs，2026-09-29）
+  //
+  // 为什么要有：`logs/watcher.log` 连续多轮只打出 `[object Object]`，
+  // **那一行完全无法诊断**。根因是 `String(结构化对象)` —— 恒等于 `[object Object]`，
+  // 而 `JSON.stringify` 只在错误为 falsy 时才用得上，于是结构化信息必然被吃掉。
+  //
+  // 本组要证的不只是「能提取」，更要证**提取失败时不留废话**：
+  // 若取不到任何字段却输出 `[object Object]`，那等于把同一个毛病换了个地方。
+  {
+    const E = String();
+
+    // ① 真实形态：上游 `opencode run --format json` 的错误事件
+    const up1 = { type: 'error', error: { message: 'Provider request failed', status: 429, retryAfter: 30 } };
+    const r1 = errText(up1.error);
+    eq(r1.degraded, false, '① 对象带 message：正常提取，不是降级路径');
+    truthy(r1.text.indexOf('Provider request failed') >= 0, '  └ 取到了 message 文本：' + r1.text);
+    truthy(r1.text.indexOf('[object Object]') < 0, '  └ **不含 [object Object]**（这就是修好的判据）');
+    eq(r1.source, 'obj.message', '  └ source 如实标明取自哪个字段');
+
+    // ② 字段名变体：msg / error / reason / detail / description
+    for (const [k, v] of [['msg', 'quota exceeded'], ['reason', 'aborted'], ['detail', 'bad request'], ['description', 'upstream 5xx']]) {
+      const r = errText({ [k]: v });
+      truthy(r.text.indexOf(v) >= 0 && r.text.indexOf('[object Object]') < 0,
+        `② 字段 ${k}：提取到「${v}」且无 [object Object]`);
+    }
+    // ②b **嵌套**：{ error: { message } } 与 { data: { message } }
+    for (const shape of [{ error: { message: 'nested-1' } }, { data: { message: 'nested-2' } }]) {
+      const r = errText(shape);
+      truthy(r.text.indexOf('[object Object]') < 0 && r.text.length > 5,
+        '  └ 嵌套形态 ' + JSON.stringify(shape).slice(0, 30) + ' → ' + r.text.slice(0, 40));
+    }
+    // ②c **数组**：{ errors: [{message}] } 这类聚合形态
+    const ra = errText({ errors: [{ message: 'multi-1' }, { message: 'multi-2' }] });
+    truthy(ra.text.indexOf('multi-') >= 0, '  └ 数组形态 → ' + ra.text.slice(0, 50));
+
+    // ③ Error 实例：必须带 name（TypeError 比「xxx failed」信息量大）
+    const r3 = errText(new TypeError('x is not a function'));
+    eq(r3.degraded, false, '③ Error 实例正常');
+    truthy(/TypeError/.test(r3.text) && /not a function/.test(r3.text), '  └ ' + r3.text);
+    // ③b 带 code 的 Error
+    const r3b = errText(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
+    truthy(/ENOENT/.test(r3b.text), '  └ 带 code 的 Error → ' + r3b.text);
+
+    // ④ **最关键的一条**：无可提取字段时，必须回落到完整 JSON，**绝不留 [object Object]**
+    const bare = errText({ status: 500, body: { upstream: 'x' }, tags: [1, 2] });
+    eq(bare.degraded, true, '④ 裸对象（无可提取字段）标记为 degraded');
+    truthy(bare.text.indexOf('status') >= 0 && bare.text.indexOf('500') >= 0,
+      '  └ 回落文本含完整结构：' + bare.text.slice(0, 70));
+    truthy(bare.text.indexOf('[无可提取字段，已回落到完整结构]') >= 0,
+      '  └ 且**显式标注**「无可提取字段」——不让一句看不出问题的裸 JSON 伪装成正常文本');
+    truthy(bare.source === 'json-fallback', '  └ source=json-fallback');
+
+    // ⑤ 平凡输入
+    eq(errText('plain string').text, 'plain string', '⑤ 字符串原样');
+    eq(errText('plain string').source, 'string', '  └ source=string');
+    // 第一版这里写 `errText(E)`（E 是空字符串）却断言应为 `(undefined)` —— **测试自己写错了**。
+    eq(errText(undefined).text, '(undefined)', '  └ undefined → (undefined) 而不是空串');
+    eq(errText('').text, '', '  └ 空字符串 → 空串（**不**当成 undefined）');
+    eq(errText(null).text, '(null)', '  └ null → (null)');
+    eq(errText(42).text, '42', '  └ 数字');
+
+    // ⑥ 截断：超长必须截断**并标注**，否则「被截断」与「本来就短」无法区分
+    const long = errText('x'.repeat(500), { max: 100 });
+    truthy(long.text.length <= 110 && /已截断/.test(long.text), '  └ 截断并标注：' + long.text.slice(-14));
+
+    // ⑦ caughtText：替代 `String(e.message || e)`
+    //    旧写法的两个毛病：① 无 .message 时退化 String(e) ② e.message 为空串时 `'' || e` 取到 e 本身
+    const r7 = caughtText({ error: { message: 'caught-obj' } });
+    truthy(r7.text.indexOf('caught-obj') >= 0, '⑦ 裸对象进 catch：' + r7.text);
+    truthy(r7.text.indexOf('[object Object]') < 0, '  └ 不含 [object Object]');
+    const r7b = caughtText(new Error('boom'));
+    truthy(r7b.text.indexOf('boom') >= 0, '  └ Error 进 catch → ' + r7b.text);
+    // ⑦b **旧写法的空串陷阱**：message 是空串时，旧的 `'' || e` 会取到 e → 打出 [object Object]
+    const empty = caughtText({ message: E, code: 'E_EMPTY' });
+    truthy(empty.text.indexOf('[object Object]') < 0, '  └ message 为空串的裸对象 → ' + empty.text.slice(0, 60));
+    truthy(/E_EMPTY/.test(empty.text), '  └ 且字段真的被提取到了（不是靠排除法蒙对）');
+
+    // ⑧ 接线：watcher 四处都必须真的用了它
+    const w = await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8');
+    const wCode = w.split(/\r?\n/).filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    truthy(wCode.indexOf('errText(p.error || ev.error || ev)') >= 0, '⑧ parseRunStream 用 errText');
+    eq((wCode.match(/caughtText\(e/g) || []).length, 3, '  └ 三处 catch 用 caughtText（实测 ' + (wCode.match(/caughtText\(e/g) || []).length + ' 处）');
+    // 断言必须只查**代码行**：注释里引用旧写法字面量是合法的（那是解释性注释）
+    truthy(wCode.indexOf('String(e.message || e)') < 0, '  └ 代码行里旧写法清零（注释里的引用不算）');
+    truthy(w.split(/\r?\n/).some((l) => /lib\/err-text\.mjs/.test(l)), '  └ import 已接上');
+  }
 
 console.log('\n[23] fail-closed 门：失败轮次不得推进基线（①：曾出现「结论产出=false 但 lastHead 已推进」）');
 {
@@ -1470,13 +1557,63 @@ console.log('\n[24] ESM 源码漂移自检 + 台账锚点完整性（⑥：ESM �
     const bdir = join(tmp, 'degrade-behaviour');
     await mkdir(join(bdir, 'scripts', 'lib'), { recursive: true });
     await copyFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), join(bdir, 'scripts', 'autodispatch-watcher.mjs'));
-    // ⚠ 必须一并复制 scripts/lib/：watcher 现在 `import './lib/dispatch-conclusion.mjs'`
-    //   （2026-09-28 收紧 conclusion 判定时新增）。只复制 watcher 本体 → 临时目录里 import 失败
-    //   → 启动即崩 → 本节全部断言红灯，且**报的是「前置没起来」而非真因**，极难定位。
+    // ⚠ 必须一并复制 scripts/lib/：watcher 现在有一堆 `import './lib/xxx.mjs'`
+    //   只复制 watcher 本体 → 临时目录里 import 失败 → 启动即崩 → 本节全部断言红灯，
+    //   且**报的是「前置没起来」而非真因**，极难定位。
     //   教训：给动态加载的文件做测试夹具时，依赖要跟着走，别只拷主体。
-    for (const dep of ['conclusion-audit.mjs', 'dispatch-conclusion.mjs', 'runbook.mjs', 'whitelist-audit.mjs', 'watchdog.mjs', 'crosscheck-hang.mjs']) {
-      const from = join(ROOT, 'scripts', 'lib', dep);
-      try { await copyFile(from, join(bdir, 'scripts', 'lib', dep)); } catch { /* lib 里没有就跳过 */ }
+    //
+    // ⚠⚠ **依赖清单必须从源码扫出来，不能手写**（2026-09-29 修正）。
+    //   我新增 `lib/err-text.mjs` 后忘了加进下面这份手写清单 → 临时目录缺文件 →
+    //   启动即崩 → **8 项断言全红**，而报出来的是「前置没起来」，
+    //   与真因（缺一个 lib 文件）隔了三层，排查花了好几轮。
+    //   **上一条教训已经写在 L1473-1476 里了，我照着又犯了一次**——
+    //   教训写成注释没有用，除非它变成机制。
+    //   现在改成：正则扫出 watcher 源码里所有 `./lib/*.mjs` import，逐个复制。
+    //   **清单从此不存在 ⇒ 以后新增 lib 文件不会再漏。**
+    const wsrc = await readFile(join(ROOT, 'scripts', 'autodispatch-watcher.mjs'), 'utf8');
+    // ⚠⚠ 依赖必须求**闭包**，不能只扫直接 import（2026-09-29 修正，踩了两次）。
+    //   ① 第一次：手写 6 个 lib 文件的清单，新增 `err-text.mjs` 忘了加 → 缺文件 → 启动即崩 → 8 项红灯。
+    //   ② 第二次：改成"扫 watcher 源码里的 import"——**仍然不够**：
+    //      `conclusion-audit.mjs` 是 `dispatch-conclusion.mjs` 的**传递依赖**，
+    //      watcher 并没有直接 import 它，于是扫不到、复制不到，
+    //      临时目录报 `ERR_MODULE_NOT_FOUND: .../lib/conclusion-audit.mjs`。
+    //      **手写清单之所以"碰巧"是对的，正因为它列的是闭包；我改成直接扫描反而丢了闭包。**
+    //   结论：**「依赖跟着走」必须是闭包，不是第一层。**教训写成注释没用，除非它变成机制。
+    // ⚠ 路径形态有两种，**都要匹配**（这是闭包漏项的真正原因）：
+    //      · watcher 里是 `./lib/xxx.mjs`（带 lib 目录前缀）
+    //      · lib 文件**之间**互相 import 时是 `./xxx.mjs`（同目录，无前缀）
+    //   我第一版只匹配 `./lib/`，于是 `dispatch-conclusion.mjs → ./conclusion-audit.mjs`
+    //   这条边扫不到，闭包不完整，临时目录仍然 `ERR_MODULE_NOT_FOUND`。
+    //   两种形态都落在 `libRoot` 下，故统一按**文件名**归一。
+    const RE_LIB = /from\s+['"]\.\/lib\/([\w.-]+\.mjs)['"]/g;
+    const RE_SIB = /from\s+['"]\.\/([\w.-]+\.mjs)['"]/g;
+    const libRoot = join(ROOT, 'scripts', 'lib');
+    const libDeps = new Set();
+    const queue = [wsrc];
+    const edges = [];
+    while (queue.length) {
+      const srcTxt = queue.pop();
+      const found = new Set();
+      for (const mm of srcTxt.matchAll(RE_LIB)) found.add(mm[1]);
+      for (const mm of srcTxt.matchAll(RE_SIB)) found.add(mm[1]);   // 同目录形态
+      for (const dep of found) {
+        edges.push(dep);
+        if (libDeps.has(dep)) continue;
+        libDeps.add(dep);
+        try { queue.push(await readFile(join(libRoot, dep), 'utf8')); }   // 递归进这个 lib 自己的 import
+        catch (e) { throw new Error('lib 依赖「' + dep + '」被 import 但源文件读不到：' + (e.message || e)); }
+      }
+    }
+    // 自证**不能拍数字**。我第一版写 `libDeps.size < 4` 就 throw，结果规模一变就崩。
+    // 真正必需的是：`parseRunStream` 运行时调用 `judgeDispatchConclusion`（来自 dispatch-conclusion.mjs），
+    // 而它自己又依赖 `conclusion-audit.mjs` —— **后者正是只有闭包才会扫到的那一个**。
+    truthy(libDeps.has('dispatch-conclusion.mjs'),
+      '  └ lib 依赖闭包 ' + libDeps.size + ' 个：' + [...libDeps].join(', '));
+    truthy(libDeps.has('conclusion-audit.mjs'),
+      '  └ 闭包里含 conclusion-audit.mjs（**传递依赖**——只扫第一层会漏掉它，2026-09-29 实测踩过）');
+    for (const dep of libDeps) {
+      try { await copyFile(join(libRoot, dep), join(bdir, 'scripts', 'lib', dep)); }
+      catch (e) { throw new Error('lib 依赖「' + dep + '」复制失败：' + (e.message || e)); }
     }
     // 源指纹只覆盖 watcher + scripts/lib/*.mjs，故必须有这个 lib 文件才改得动指纹
     const libFile = join(bdir, 'scripts', 'lib', 'probe.mjs');

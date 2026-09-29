@@ -34,6 +34,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { judgeDispatchConclusion } from './lib/dispatch-conclusion.mjs';
 import { readRunbook, hasSignedReview } from './lib/runbook.mjs';
+import { errText, caughtText } from './lib/err-text.mjs';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { readFile, writeFile, readdir, rename, unlink } from 'node:fs/promises';
@@ -724,7 +725,12 @@ export function parseRunStream(text) {
     if (ev.type === 'text' || p.type === 'text') {
       if (p.text) texts.push(String(p.text));
     } else if (ev.type === 'error' || p.type === 'error' || ev.error) {
-      errors.push(String(p.error || ev.error || JSON.stringify(ev)).slice(0, 300));
+      // 旧写法 `String(p.error || ev.error || JSON.stringify(ev))`：当 **error 是对象**时
+      // 恒等于 `"[object Object]"`——而 `JSON.stringify` 只在 error 为 falsy 时才用得上，
+      // 于是结构化错误**必然**被 `String()` 吃掉，日志里只剩一句无法诊断的废话
+      //（2026-09-29 实测连续多轮出现该行）。改用 `errText`：按字段可靠性依次探测，
+      // 取不到就**回落到完整 JSON**，并在确实取不到字段时显式标注，不留 `[object Object]` 蒙混。
+      errors.push(errText(p.error || ev.error || ev).text);
     } else if (/free tier|unauthorized|rate.?limit|quota|not allowed|forbidden/i.test(t)) {
       errors.push(t.slice(0, 300));
     }
@@ -847,7 +853,7 @@ async function ledgerDoctor(flags) {
     log('    这些问题会让派单记录被解析器忽略，等于审计链断裂；请人工检查三张台账');
     return { ok: false, output: out };
   } catch (e) {
-    log(`[!] 台账自检无法执行: ${String(e.message || e).slice(0, 120)}`);
+    log(`[!] 台账自检无法执行: ${caughtText(e, { max: 120 }).text}`);
     return { ok: false, output: '' };
   }
 }
@@ -868,7 +874,7 @@ async function refreshViews() {
       const first = (r.stdout || '').split(/\r?\n/).find((l) => l.includes('已刷新')) || '';
       results.push({ script, ok: true, msg: first.trim() });
     } catch (e) {
-      results.push({ script, ok: false, msg: String(e.message || e).slice(0, 120) });
+      results.push({ script, ok: false, msg: caughtText(e, { max: 120 }).text });
     }
   }
   for (const r of results) log(`  派生视图 ${r.ok ? '已刷新' : '刷新失败'}：${r.msg || r.script}`);
@@ -885,7 +891,7 @@ export async function healthCheck(cli, dir, { timeout = 90000 } = {}) {
     const ok = p.conclusion || p.sessionId;
     return { ok: Boolean(ok), ms: Date.now() - t0, sessionId: p.sessionId || null, errors: p.errors };
   } catch (e) {
-    return { ok: false, ms: Date.now() - t0, sessionId: null, errors: [String(e.message || e).slice(0, 200)] };
+    return { ok: false, ms: Date.now() - t0, sessionId: null, errors: [caughtText(e, { max: 200 }).text] };
   }
 }
 
