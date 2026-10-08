@@ -150,7 +150,10 @@ async function main() {
     const own = texts.filter((t) => !t.startsWith('You are a subagent'));   // 排除提示词模板
     const promptHit = /点路径清单|git ls-files/.test(texts.join('\n'));    // 点路径纪律是否透传到该子会话
     const cands = [];
-    for (const t of own) for (const b of extractBlocks(t)) cands.push(b);
+    // 排除「源码字面量」候选（2026-10-08，见 06 §9.4）：真结论块必为**多行**（契约格式
+    // `<!--结论\n事项: …`）；单行片段（如 selftest 源码里的 `<!--结论x-->`、`'<!--结论'`）
+    // 几乎必为代码字符串/文档样例——子会话读取 `selftest.mjs` 时会把它们大量带进来，污染导出。
+    for (const t of own) for (const b of extractBlocks(t)) if (b.includes('\n')) cands.push(b);
     const { real: uniq, bogus: bogusUniq } = partitionBlocks(cands);
     blocks += uniq.length;
     templates += bogusUniq.length;

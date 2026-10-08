@@ -1019,6 +1019,10 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     eq(judgeDispatchConclusion([NEST]).real, 1, '块内引用 anchor 的合规真块仍计入 real（配平扫描回归）');
     truthy(extractConclusionBlocks('a<!--结论x-->b<!--结论y-->').length === 2,
       '配平扫描下多块仍正确（既有行为不回退）');
+    // 未闭合的 `<!--结论` 字面量（源码字符串形态）**不得静默丢弃其后真块**（2026-10-08，见 06 §9.4）
+    const UNCLOSED = "源码里有 '<!--结论' 这样的未闭合字面量；\n" + NEST;
+    truthy(extractConclusionBlocks(UNCLOSED).some((b) => b.includes('升级对象')),
+      '未闭合的 `<!--结论` 字面量不得丢弃其后真块（回归：曾 break 致其后全丢）');
   }
   // 22.12 待签批清单状态列派生（approval-sync 新增的第三个写目标）
   //

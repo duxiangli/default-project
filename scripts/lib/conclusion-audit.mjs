@@ -64,9 +64,15 @@ export function extractConclusionBlocks(text, trim = false) {
   const s = String(text || '');
   const out = [];
   let i = 0;
-  while ((i = s.indexOf('<!--结论', i)) >= 0) {
+  const MARK = '<!--结论';
+  while ((i = s.indexOf(MARK, i)) >= 0) {
     const end = matchCommentEnd(s, i);
-    if (end < 0) break;
+    if (end < 0) {
+      // 未闭合（如源码字符串里的 `'<!--结论'`）：**不得 break**——那会静默丢掉其后
+      // **所有**块（实测见 06 §9.4）。只跳过这个标记，继续找下一个 `<!--结论`。
+      i += MARK.length;
+      continue;
+    }
     const b = s.slice(i, end);
     out.push(trim ? b.trim() : b);
     i = end;
