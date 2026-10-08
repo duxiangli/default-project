@@ -18,20 +18,16 @@
 // 不推进基线 → 下轮重派。**这是 fail-closed 方向**（宁可重派也不放过未评审），
 // 但代价是需要人介入；故同时把判定细节写进日志，便于定位是「没出块」还是「出块不合规」。
 
-import { isRealConclusion, missingFields, placeholderFieldCount } from './conclusion-audit.mjs';
+import { isRealConclusion, missingFields, placeholderFieldCount, extractConclusionBlocks } from './conclusion-audit.mjs';
 
-/** 从一段文本里抽出所有 `<!--结论 … -->` 块（与导出脚本同一取法） */
-export function extractConclusionBlocks(text) {
-  const out = [];
-  let i = 0;
-  while ((i = text.indexOf('<!--结论', i)) >= 0) {
-    const end = text.indexOf('-->', i);
-    if (end < 0) break;
-    out.push(text.slice(i, end + 3));
-    i = end + 3;
-  }
-  return out;
-}
+/**
+ * `extractConclusionBlocks` 的**配平扫描实现已下沉**到 `lib/conclusion-audit.mjs`
+ * （与 `export-expert-conclusions.mjs` 共用同一取法，避免两份实现漂移——本体系反复吃亏处）。
+ * 这里 re-export，保持既有 import 路径（selftest 等）。
+ * 2026-10-08：朴素 `indexOf('-->')` 会在块内引用的内层 `-->`（如 `` `<!-- pending-approval-end -->` ``）处截断，
+ * 导致合规块缺「行动/升级对象」→ 判「无结论」→ 反复重派。见 `matchCommentEnd` 注释。
+ */
+export { extractConclusionBlocks };
 
 /**
  * @param {string[]} texts  派单会话的文本产出

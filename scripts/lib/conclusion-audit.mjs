@@ -24,6 +24,56 @@ export const REQUIRED_FIELDS = [
   ['升级对象', /升级对象\s*[:：]/],
 ];
 
+/**
+ * 从 `start`（指向某 `<!--`）起配平扫描到**匹配的** `-->`，返回其**之后**的下标；未闭合返回 -1。
+ *
+ * ── 为什么不能用 `indexOf('-->')`（2026-10-08 实测事故）──────────────────
+ * 专家会在结论块的「依据」里**引用 anchor**，例如
+ *   `… 待签批清单.md:49 报 \`<!-- pending-approval-end -->\` …`
+ * 朴素扫描在**内层 `-->`** 处就收尾 → 块被截断在「依据」中途 → 缺「行动/升级对象」
+ * → `isRealConclusion` 判不合格 → watcher 判「无结论」→ **fail-closed 反复重派**
+ * （台账灌水 + 熔断 trips），且 `export-expert-conclusions.mjs` 会导出**截断原文**。
+ * 全量实测：108 个含块专家子会话里，朴素扫描误判 3 个（≈2.8%），配平扫描 0 个。
+ *
+ * 规则：遇 `<!--` 深度 +1、遇 `-->` 深度 −1，归零处即本块结束。
+ */
+export function matchCommentEnd(text, start) {
+  const s = String(text || '');
+  let depth = 0;
+  let k = start;
+  while (k < s.length) {
+    if (s.startsWith('<!--', k)) { depth += 1; k += 4; continue; }
+    if (s.startsWith('-->', k)) {
+      depth -= 1; k += 3;
+      if (depth === 0) return k;
+      continue;
+    }
+    k += 1;
+  }
+  return -1;
+}
+
+/**
+ * 从一段文本里抽出所有 `<!--结论 … -->` 块（配平扫描，见 `matchCommentEnd`）。
+ * 与 `export-expert-conclusions.mjs` 共用同一取法——**两份实现只要有一份更宽松，
+ * 那道护栏就形同虚设**（本体系反复吃亏处）。
+ * @param {string} text
+ * @param {boolean} trim 是否 trim 每块（导出侧用 true）
+ */
+export function extractConclusionBlocks(text, trim = false) {
+  const s = String(text || '');
+  const out = [];
+  let i = 0;
+  while ((i = s.indexOf('<!--结论', i)) >= 0) {
+    const end = matchCommentEnd(s, i);
+    if (end < 0) break;
+    const b = s.slice(i, end);
+    out.push(trim ? b.trim() : b);
+    i = end;
+  }
+  return out;
+}
+
 /** 返回该文本缺失的必填字段名；空数组 = 字段齐全 */
 export function missingFields(block) {
   const s = String(block || '');

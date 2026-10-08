@@ -1004,6 +1004,21 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     // DASH 是合法取值（「严重度: —」），必须计入 real —— 它不是占位符
     eq([judgeDispatchConclusion([DASH]).blocks, judgeDispatchConclusion([DASH]).real], [1, 1],
       '「严重度: —」计入 real（破折号不是占位符）');
+
+    /* 2026-10-08 回归：块内**引用 HTML 注释 anchor**（形如 `<!-- x -->`）时不得被截断。
+     * 实测事故：expert/20-docs 在「依据」里写 `` `<!-- pending-approval-end -->` ``，
+     * 朴素 `indexOf('-->')` 在**内层 `-->`** 处收尾 → 块缺「行动/升级对象」→ 判「无结论」
+     * → watcher fail-closed 反复重派（台账灌水）；导出侧同样拿到**截断原文**。
+     * 全量实测：108 个含块专家子会话，朴素扫描误判 3 个（≈2.8%），配平扫描 0 个。 */
+    const NEST = '<!--结论\n事项: 引 anchor\nR: expert/20-docs\nC: —\n四态: 建议批准\n严重度: 低\n'
+      + '依据: 待签批清单.md:49 报 `<!-- pending-approval-end -->` 且 审批记录.md:63 报 `<!-- approval-ledger-end -->`\n'
+      + '行动: 动作=补链接; 责任人=expert/20-docs; 时限=签批前\n升级对象: 无\n数据缺失: 无\n-->';
+    eq(extractConclusionBlocks(NEST).length, 1, '块内引用 anchor：仍只抽出 1 块');
+    truthy(extractConclusionBlocks(NEST)[0].includes('升级对象'),
+      '块内引用 anchor 时不得被内层 `-->` 截断（回归：曾截断致缺「行动/升级对象」）');
+    eq(judgeDispatchConclusion([NEST]).real, 1, '块内引用 anchor 的合规真块仍计入 real（配平扫描回归）');
+    truthy(extractConclusionBlocks('a<!--结论x-->b<!--结论y-->').length === 2,
+      '配平扫描下多块仍正确（既有行为不回退）');
   }
   // 22.12 待签批清单状态列派生（approval-sync 新增的第三个写目标）
   //

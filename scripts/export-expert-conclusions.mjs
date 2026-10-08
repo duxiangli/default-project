@@ -86,25 +86,18 @@ const walkTexts = (o, out = []) => {
   return out;
 };
 
-/** 从文本里抽出结论块正文（取最后一次出现的 <!--结论 到最近的 -->） */
-const extractBlocks = (t) => {
-  const out = [];
-  let i = 0;
-  while ((i = t.indexOf('<!--结论', i)) >= 0) {
-    const end = t.indexOf('-->', i);
-    if (end < 0) break;
-    out.push(t.slice(i, end + 3).trim());
-    i = end + 3;
-  }
-  return out;
-};
+/** 从文本里抽出结论块正文（trim）。
+ *  2026-10-08：由朴素 `indexOf('-->')` 改为**配平扫描**（见 `lib/conclusion-audit.mjs` 的 `matchCommentEnd`）——
+ *  专家会在块内「依据」里引用 anchor（如 `` `<!-- pending-approval-end -->` ``），
+ *  朴素扫描在内层 `-->` 处截断，导出的是**截断原文**。 */
+const extractBlocks = (t) => extractConclusionBlocks(t, true);
 
 /* ── 结论块有效性判定已移至 scripts/lib/conclusion-audit.mjs ──
  * 2026-09-28 因 DSP-20260928-1213-01 复核踩到「假原文」而加，详见该文件。
  * 放在 lib/ 是为了让 selftest 能直接 import 测它——
  * 否则又是一条「没被测过的护栏」，正是本体系反复栽的跟头。
  */
-import { partitionBlocks } from './lib/conclusion-audit.mjs';
+import { partitionBlocks, extractConclusionBlocks } from './lib/conclusion-audit.mjs';
 
 async function main() {
   const cli = cliPath();
