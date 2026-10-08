@@ -139,7 +139,7 @@ export function repair(text, spec) {
         //   上一行已剥掉尾部空串，此处再剥一刀会把**最后一格真实数据**切掉——
         //   接着 `< spec.cols` 分支会用「—」把它补回来，于是一行的末列（需签批）
         //   被静默抹成「—」。2026-09-29 实测：只要有 1 行列数异常，本分支会重写
-        //   全部数据行，导致**所有行的需签批被清空**（回归见 selftest §25）。
+        //   全部数据行，导致**所有行的需签批被清空**（回归见 selftest §14②b）。
         let body = cells.slice(1).map((c) => c.trim());
         if (body.length < spec.cols) {
           for (let k = body.length; k < spec.cols; k++) {
