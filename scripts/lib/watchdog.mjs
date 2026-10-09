@@ -31,6 +31,20 @@ export function lastHeartbeat(logText) {
 export const VERDICT = { FRESH: 'FRESH', STALE: 'STALE', UNKNOWN: 'UNKNOWN' };
 
 /**
+ * 解析「本机计划任务是否存在」判断的 stdout（PowerShell `(Get-ScheduledTask …) -ne $null`）。
+ *
+ * **为什么必须解析输出、而不是看退出码**（2026-10-09 实测）：该表达式在任务**不存在**时
+ * 也**正常退出 0**、只打印 `False`。旧写法用 `{ stdio: 'ignore' }` 且「命令跑通即
+ * `residentExpected = true`」，于是 **Windows 上恒判「应当有常驻」**——即便计划任务早已卸载，
+ * 停掉的常驻也会被 `judgeHeartbeat` 判成 `STALE` → `validate` **假红**。
+ * 判据下沉为纯函数，便于单测（本体系已四次栽在「判据住在不可测的地方」）。
+ */
+export function taskExistsFromStdout(stdout) {
+  // 命中「某一行就是 True/False」（大小写不敏感、容忍前后空白与多余行）。
+  return /^[ \t]*true[ \t]*$/im.test(String(stdout || ''));
+}
+
+/**
  * @param {object} o
  * @param {string|null} o.logText  watcher.log 内容（读不到传 null）
  * @param {boolean} o.residentExpected 本机是否应当有常驻在跑
@@ -70,12 +84,16 @@ export function judgeHeartbeat({ logText, residentExpected, maxSilenceSec, now =
     return { ...base, verdict: VERDICT.UNKNOWN, reason: base.reason + '；**心跳时间在未来**，疑似时钟/时区错位 → 无法评估' };
   }
   if (ageSec > thresholdSec) {
+    if (!residentExpected) {
+      // 本机**未声明**应有常驻（如 CI、或已停用常驻的开发机）：心跳陈旧是**预期**的。
+      // 旧行为无条件判 STALE，会把「主动停掉常驻」变成假红（2026-10-09 实测）。
+      // 判 UNKNOWN——既不报绿、也不谎报故障。
+      return { ...base, verdict: VERDICT.UNKNOWN, reason: base.reason + '；本机未声明应有常驻（如 CI / 已停用）→ 陈旧心跳属预期，不适用' };
+    }
     return {
       ...base,
       verdict: VERDICT.STALE,
-      reason: base.reason + (residentExpected
-        ? '　→ **常驻疑似已停**，需人工重启（Stop-ScheduledTask → 杀残留 node → Start-ScheduledTask）'
-        : '　→ 超过阈值'),
+      reason: base.reason + '　→ **常驻疑似已停**，需人工重启（Stop-ScheduledTask → 杀残留 node → Start-ScheduledTask）',
     };
   }
   // 心跳「新鲜」但本机**不应当**有常驻在跑——这只可能是读到了一份**冻结的历史日志**

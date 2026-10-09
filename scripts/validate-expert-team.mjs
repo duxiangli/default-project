@@ -10,7 +10,7 @@ import { auditApprovalBasis, viewGeneratedAt, VIEW_FILES } from './lib/approval-
 import { isBarePlaceholder, commitHashesIn, duplicateQueueStats } from './lib/runbook.mjs';
 import { auditDocAssertions } from './lib/doc-assert.mjs';
 import { auditColumnShapes } from './lib/col-shape.mjs';
-import { judgeHeartbeat, resolveThreshold, VERDICT } from './lib/watchdog.mjs';
+import { judgeHeartbeat, resolveThreshold, VERDICT, taskExistsFromStdout } from './lib/watchdog.mjs';
 import { execFileSync } from 'node:child_process';
 
 /** 统一归一化换行：CRLF 检出（Windows）下校验结果必须与 LF 检出（Linux CI）一致 */
@@ -562,9 +562,14 @@ else bad(`自动化资产问题: ${assetIssues.join('; ')}`);
     let residentExpected = false;
     if (process.env.AUTODISPATCH_RESIDENT_EXPECTED === '1') residentExpected = true;
     else if (process.platform === 'win32') {
-      try { execFileSync('powershell', ['-NoProfile', '-Command',
-        "(Get-ScheduledTask -TaskName 'OpenCode-ExpertTeam-Autodispatch' -ErrorAction SilentlyContinue) -ne $null"],
-        { stdio: 'ignore', timeout: 8000 }); residentExpected = true; } catch { residentExpected = false; }
+      // ⚠ 必须**取输出并解析**，不能只看退出码——`(…) -ne $null` 在任务不存在时也会**退出 0 并打印 False**；
+      //   旧写法 `{ stdio: 'ignore' }` + 「跑通即 true」会让 Windows 上**恒判「应当有常驻」**（2026-10-09 实测）。
+      try {
+        const out = execFileSync('powershell', ['-NoProfile', '-Command',
+          "(Get-ScheduledTask -TaskName 'OpenCode-ExpertTeam-Autodispatch' -ErrorAction SilentlyContinue) -ne $null"],
+          { encoding: 'utf8', timeout: 8000 });
+        residentExpected = taskExistsFromStdout(out);
+      } catch { residentExpected = false; }
     }
     const thr = resolveThreshold(Number(process.env.AUTODISPATCH_MAX_SILENCE || 0), 120);
     const hb = judgeHeartbeat({ logText, residentExpected, maxSilenceSec: thr });

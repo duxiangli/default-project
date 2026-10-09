@@ -24,7 +24,7 @@ import { auditDocAssertions, markersIn, DOC_CHECKS } from './lib/doc-assert.mjs'
 import { hasSignedReview, commitHashesIn, readRunbook, duplicateQueueStats } from './lib/runbook.mjs';
 import { errText, caughtText } from './lib/err-text.mjs';
 import { auditWhitelist } from './lib/whitelist-audit.mjs';
-import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/watchdog.mjs';
+import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT, taskExistsFromStdout } from './lib/watchdog.mjs';
 import { auditApprovalBasis, splitClauses, viewGeneratedAt, daysStale, PRODUCERS } from './lib/approval-basis-audit.mjs';
 import { planPendingStatus, applyPendingStatus, statusTextFor } from './lib/pending-status.mjs';
 import { judgeDispatchConclusion, extractConclusionBlocks } from './lib/dispatch-conclusion.mjs';
@@ -781,6 +781,20 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     truthy(THR === 420, `阈值 = max(给定, 间隔×3+60) = ${THR}s（>3 个轮询周期，正常间隔不会误报）`);
     eq(resolveThreshold(1800, 120), 1800, '显式给定的更大阈值被尊重');
     eq(resolveThreshold(60, 300), 960, '间隔大时自动抬高阈值（300×3+60）');
+
+    /* 2026-10-09：判「本机是否应有常驻」必须**解析 PowerShell 输出**，不能只看退出码——
+     * `(Get-ScheduledTask …) -ne $null` 在任务**不存在**时也退出 0、只打印 `False`，
+     * 旧写法 `{stdio:'ignore'}` + 「跑通即 true」会让 Windows 上**恒判「应当有常驻」** → 停服假红。 */
+    eq(taskExistsFromStdout('True\n'), true, '输出 True → 任务存在');
+    eq(taskExistsFromStdout('False\n'), false, '输出 False → 任务不存在（旧写法会误判 true）');
+    eq(taskExistsFromStdout(''), false, '空输出 → 不存在');
+    eq(taskExistsFromStdout('  true  '), true, '容忍前后空白');
+    eq(taskExistsFromStdout('警告: 某东西\nTrue\n'), true, '容忍多余行，只要有一行是 True');
+    // 2026-10-09：陈旧心跳**只有在本机声明应有常驻时**才判 STALE；否则「主动停掉常驻」会假红
+    eq(judgeHeartbeat({ logText: log('2026-09-28 03:50:00'), residentExpected: false, maxSilenceSec: THR, now: NOW }).verdict,
+      VERDICT.UNKNOWN, '心跳超阈值但未声明有常驻 → UNKNOWN（防「主动停常驻」假红）');
+    eq(judgeHeartbeat({ logText: log('2026-09-28 03:50:00'), residentExpected: true, maxSilenceSec: THR, now: NOW }).verdict,
+      VERDICT.STALE, '心跳超阈值且声明有常驻 → 仍 STALE（不漏报停服）');
 
     // 正常在跑
     eq(judgeHeartbeat({ logText: log('2026-09-28 03:59:00'), residentExpected: true, maxSilenceSec: THR, now: NOW }).verdict, VERDICT.FRESH, '心跳新鲜且声明有常驻 → FRESH');
