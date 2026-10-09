@@ -28,7 +28,7 @@ import { judgeHeartbeat, resolveThreshold, lastHeartbeat, VERDICT } from './lib/
 import { auditApprovalBasis, splitClauses, viewGeneratedAt, daysStale, PRODUCERS } from './lib/approval-basis-audit.mjs';
 import { planPendingStatus, applyPendingStatus, statusTextFor } from './lib/pending-status.mjs';
 import { judgeDispatchConclusion, extractConclusionBlocks } from './lib/dispatch-conclusion.mjs';
-import { partitionBlocks, missingFields, isRealConclusion, placeholderFieldCount } from './lib/conclusion-audit.mjs';
+import { partitionBlocks, missingFields, isRealConclusion, placeholderFieldCount, splitBlockCandidates, isBlockShaped } from './lib/conclusion-audit.mjs';
 import { auditHangRows, openHangClauses, contradictoryClauses, DISP_COL } from './lib/crosscheck-hang.mjs';
 import { analyze, repair, SPECS } from './ledger-doctor.mjs';
 import { matchPathRules, buildDotPathNotice } from './autodispatch-watcher.mjs';
@@ -1023,6 +1023,26 @@ console.log('\n[22] 免评审白名单（⑤：治签批 treadmill，但口子�
     const UNCLOSED = "源码里有 '<!--结论' 这样的未闭合字面量；\n" + NEST;
     truthy(extractConclusionBlocks(UNCLOSED).some((b) => b.includes('升级对象')),
       '未闭合的 `<!--结论` 字面量不得丢弃其后真块（回归：曾 break 致其后全丢）');
+
+    /* 2026-10-08（DSP-20261008-1503-01 C14）：单行「源码字面量」过滤下沉为**可测纯函数**，
+     * 且被滤项**显式返回**（不静默丢弃）。真结论块必为多行；单行片段是代码/文档样例。 */
+    eq(isBlockShaped('<!--结论\n事项: x\n-->'), true, '多行片段具备块形态');
+    eq(isBlockShaped('<!--结论x-->'), false, '单行片段不具块形态（源码字面量）');
+    const split = splitBlockCandidates(['<!--结论x-->', NEST, "'<!--结论'"]);
+    eq(split.blocks.length, 1, 'splitBlockCandidates：只把多行块留作候选');
+    eq(split.literals.length, 2, 'splitBlockCandidates：单行字面量被**显式返回**（不静默丢弃）');
+    truthy(split.blocks[0].includes('升级对象'), '留作候选的是完整块');
+
+    /* 2026-10-08（1503-01 R）：钉住「未闭合 `<!--结论` 之后出现**独立** `-->`」这一残余变体的配平行为——
+     * 扫描器会把那个 `-->` 当块尾，得到一段含「半截」的片段。此断言**锁住该形态**：
+     * ① 不臆造第二块；② 该片段缺契约字段 → 不作为真块（防「误配平产出假真块」）。 */
+    const STRAY = '<!--结论\n事项: 写到一半就断了\n后面是无关正文\n';
+    eq(extractConclusionBlocks(STRAY).length, 0, '未闭合且无 `-->` → 返回 0 块（不臆造）');
+    const STRAY2 = '<!--结论\n事项: 写到一半\n正文';      // 未闭合
+    const STRAY3 = STRAY2 + '\n--> 之后还有正文';          // 末尾补一个独立 `-->`
+    const r3 = extractConclusionBlocks(STRAY3);
+    eq(r3.length, 1, '未闭合后遇独立 `-->` 会成 1 段（钉住该配平行为）');
+    eq(isRealConclusion(r3[0] || ''), false, '该片段缺契约字段 → 不作为真块（防误配平产出假真块）');
   }
   // 22.12 待签批清单状态列派生（approval-sync 新增的第三个写目标）
   //

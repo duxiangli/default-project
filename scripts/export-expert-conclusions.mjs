@@ -97,7 +97,7 @@ const extractBlocks = (t) => extractConclusionBlocks(t, true);
  * 放在 lib/ 是为了让 selftest 能直接 import 测它——
  * 否则又是一条「没被测过的护栏」，正是本体系反复栽的跟头。
  */
-import { partitionBlocks, extractConclusionBlocks } from './lib/conclusion-audit.mjs';
+import { partitionBlocks, extractConclusionBlocks, splitBlockCandidates } from './lib/conclusion-audit.mjs';
 
 async function main() {
   const cli = cliPath();
@@ -118,7 +118,7 @@ async function main() {
 
   const report = [];
   const json = { main: { id: main.id, title: main.title }, experts: [] };
-  let blocks = 0, gates = 0, flags = 0, missing = 0, benign = 0, templates = 0;
+  let blocks = 0, gates = 0, flags = 0, missing = 0, benign = 0, templates = 0, literals = 0;
 
   report.push(`# 专家结论原文导出`);
   report.push('');
@@ -149,11 +149,13 @@ async function main() {
     const texts = walkTexts(data);
     const own = texts.filter((t) => !t.startsWith('You are a subagent'));   // 排除提示词模板
     const promptHit = /点路径清单|git ls-files/.test(texts.join('\n'));    // 点路径纪律是否透传到该子会话
-    const cands = [];
-    // 排除「源码字面量」候选（2026-10-08，见 06 §9.4）：真结论块必为**多行**（契约格式
-    // `<!--结论\n事项: …`）；单行片段（如 selftest 源码里的 `<!--结论x-->`、`'<!--结论'`）
-    // 几乎必为代码字符串/文档样例——子会话读取 `selftest.mjs` 时会把它们大量带进来，污染导出。
-    for (const t of own) for (const b of extractBlocks(t)) if (b.includes('\n')) cands.push(b);
+    const raw = [];
+    for (const t of own) for (const b of extractBlocks(t)) raw.push(b);
+    // 分出「块形态」与「源码字面量」——真结论块必为多行（契约格式 `<!--结论\n事项: …`）；
+    // 单行片段（如 selftest 源码里的 `<!--结论x-->`、`'<!--结论'`）是代码字符串/文档样例。
+    // 下沉为可测纯函数 splitBlockCandidates，且被滤项**显式计数**而非静默丢弃（2026-10-08，见 06 §9.4）。
+    const { blocks: cands, literals: litCands } = splitBlockCandidates(raw);
+    literals += litCands.length;
     const { real: uniq, bogus: bogusUniq } = partitionBlocks(cands);
     blocks += uniq.length;
     templates += bogusUniq.length;
@@ -171,6 +173,7 @@ async function main() {
         + `已标注不计入结论块（否则会导出**假原文**。2026-09-28 修复）：`);
       for (const x of bogusUniq) report.push(`    · ${x.why}　片段开头：「${x.b.slice(0, 60).replace(/\n/g, ' ')}」`);
     }
+    if (litCands.length) report.push(`- （另有 ${litCands.length} 段**单行源码字面量**已滤除，不计入候选——非结论、也非失真）`);
     report.push('');
 
     if (!uniq.length) {
@@ -209,6 +212,9 @@ async function main() {
   if (templates) {
     report.push(`- **非结论块（带 \`<!--结论\` 标记但缺契约必填字段）共 ${templates} 段**，已标注排除。`
       + `不报数就会把「少了一段」伪装成「本来就那么多」——那与假原文是同一个错误的两个方向`);
+  }
+  if (literals) {
+    report.push(`- 另有 **${literals} 段单行源码字面量**已滤除（真结论块必为多行；滤除数显式报出，不静默丢弃）`);
   }
   report.push(`- 标记：${flags}　其中**疑似引述**（专家在转述被拒的注入）：${benign}　真正待判读：${flags - benign}　导出失败：${missing}`);
   report.push('');

@@ -80,6 +80,31 @@ export function extractConclusionBlocks(text, trim = false) {
   return out;
 }
 
+/**
+ * 该候选是否具备「块形态」：真结论块必为**多行**（契约格式 `<!--结论\n事项: …`）。
+ * 单行片段（如 `<!--结论x-->`、源码里的 `'<!--结论'`）是**源码字面量/文档样例**，
+ * 不是块候选——子会话读取 `selftest.mjs` 等源码时会把它们大量带进来（实测见 06 §9.4）。
+ *
+ * 2026-10-08 由专家 `expert/14-qa-governance` 在 `DSP-20261008-1503-01` 指出：原先这层过滤
+ * **内联在导出脚本里**、且**静默丢弃**、无断言。现下沉为可测纯函数，并把被滤项**显式返回**。
+ */
+export function isBlockShaped(b) {
+  return String(b || '').includes('\n');
+}
+
+/**
+ * 把候选块分成「块形态」与「源码字面量」两堆——后者**显式返回**而非静默丢弃
+ * （专家要求：静默丢弃会把「少了一段」伪装成「本来就那么多」）。
+ * @param {string[]} cands
+ * @returns {{ blocks: string[], literals: string[] }}
+ */
+export function splitBlockCandidates(cands) {
+  const blocks = [];
+  const literals = [];
+  for (const b of Array.isArray(cands) ? cands : []) (isBlockShaped(b) ? blocks : literals).push(b);
+  return { blocks, literals };
+}
+
 /** 返回该文本缺失的必填字段名；空数组 = 字段齐全 */
 export function missingFields(block) {
   const s = String(block || '');
